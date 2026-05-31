@@ -30,6 +30,7 @@ import secrets
 import sqlite3
 import threading
 import webbrowser
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -66,6 +67,13 @@ def _load_auth_users() -> dict:
 
 
 AUTH_USERS = _load_auth_users()
+
+# Feedback capture (beta): append-only JSONL, kept separate from the read-only
+# corpus DB. On Render set FEEDBACK_PATH=/var/data/feedback.jsonl (persistent disk);
+# locally it defaults under data/. FEEDBACK_ADMIN may read it in-app.
+FEEDBACK_PATH = Path(os.environ.get("FEEDBACK_PATH", str(PROJECT / "data" / "feedback.jsonl")))
+FEEDBACK_ADMIN = os.environ.get("FEEDBACK_ADMIN", "noah")
+_fb_lock = threading.Lock()
 
 # Display order: formal -> dynamic, PD and internal interleaved by tradition.
 TRANS_ORDER = ["NASB", "NKJV", "KJV", "ASV", "YLT", "NIV", "NLT", "DRC", "CPDV", "JPS", "BRENTON"]
@@ -338,6 +346,42 @@ def format_lex_html(s: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Feedback (append-only JSONL on a writable path; corpus DB stays read-only)
+# --------------------------------------------------------------------------- #
+
+def record_feedback(user, data: dict) -> None:
+    ch = data.get("chapter")
+    rec = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "user": user or "",
+        "comment": (data.get("comment") or "").strip()[:4000],
+        "book": (data.get("book") or "")[:32],
+        "chapter": int(ch) if str(ch).isdigit() else None,
+        "ref": (data.get("ref") or "")[:64],
+        "pu": (data.get("pu") or "")[:64],
+        "strong": (data.get("strong") or "")[:16],
+        "word": (data.get("word") or "")[:64],
+    }
+    FEEDBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _fb_lock:
+        with open(FEEDBACK_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def read_feedback(limit: int = 200) -> list:
+    if not FEEDBACK_PATH.exists():
+        return []
+    out = []
+    for ln in FEEDBACK_PATH.read_text(encoding="utf-8").splitlines()[-limit:]:
+        try:
+            out.append(json.loads(ln))
+        except Exception:
+            pass
+    out.reverse()  # newest first
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # HTTP
 # --------------------------------------------------------------------------- #
 
@@ -400,8 +444,39 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(q_word(qs["strong"][0]))
             elif u.path == "/api/verse":
                 self._json(q_verse(qs["pu"][0]))
+            elif u.path == "/api/feedback":  # admin-only read
+                if self._auth_user() != FEEDBACK_ADMIN:
+                    self._send(403, json.dumps({"error": "forbidden"}).encode(), "application/json")
+                else:
+                    self._json({"items": read_feedback()})
             else:
                 self._send(404, b"not found", "text/plain")
+        except Exception as exc:  # noqa: BLE001
+            self._send(500, json.dumps({"error": str(exc)}).encode(), "application/json")
+
+    def do_POST(self):
+        u = urlparse(self.path)
+        user = self._auth_user()
+        if user is None:
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="Source Text"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if u.path != "/api/feedback":
+            self._send(404, b"not found", "text/plain")
+            return
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            if n <= 0 or n > 16384:
+                self._send(400, json.dumps({"error": "bad size"}).encode(), "application/json")
+                return
+            data = json.loads(self.rfile.read(n).decode("utf-8"))
+            if not (data.get("comment") or "").strip():
+                self._send(400, json.dumps({"error": "empty"}).encode(), "application/json")
+                return
+            record_feedback(user, data)
+            self._json({"ok": True})
         except Exception as exc:  # noqa: BLE001
             self._send(500, json.dumps({"error": str(exc)}).encode(), "application/json")
 
@@ -465,11 +540,25 @@ body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,Bl
 #panel .rights{font-size:11px;color:var(--internal);margin-top:10px;line-height:1.5}
 #panel .loading{color:var(--faint);font-size:13px;margin-top:20px}
 footer{color:var(--faint);font-size:12px;border-top:1px solid var(--line);padding-top:18px;margin-top:40px}
+/* feedback */
+.fbbtn{font:inherit;font-size:12px;padding:5px 9px;border:1px solid var(--line);border-radius:7px;background:#fff;color:var(--muted);cursor:pointer}
+.fbbtn:hover{color:var(--ink);border-color:var(--accent)}
+#fb{position:fixed;right:18px;bottom:18px;width:340px;max-width:92vw;background:#fff;border:1px solid var(--line);border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.16);transform:translateY(12px);opacity:0;pointer-events:none;transition:opacity .15s,transform .15s;z-index:11;padding:16px}
+#fb.open{opacity:1;transform:none;pointer-events:auto}
+#fb .close{position:absolute;top:8px;right:10px;border:none;background:none;font-size:20px;color:var(--faint);cursor:pointer}
+#fb h3{margin:0 0 3px;font-size:14px;font-weight:600}
+#fb .ctx{font-size:12px;color:var(--faint);margin:0 0 10px}
+#fb textarea{width:100%;min-height:84px;font:inherit;font-size:14px;padding:8px;border:1px solid var(--line);border-radius:8px;resize:vertical;color:var(--ink)}
+#fb .row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:10px}
+#fb .note{font-size:11px;color:var(--faint)}
+#fb button.send{font:inherit;font-size:13px;padding:6px 13px;border:none;border-radius:8px;background:var(--accent);color:#fff;cursor:pointer}
+#fb button.send:disabled{opacity:.5;cursor:default}
+#fb .done{font-size:13px;color:var(--accent);padding:8px 2px}
 """
 
 JS = r"""
 const $ = s => document.querySelector(s);
-let BOOKS = [], cur = {osis:null, ch:1, name:''}, targetVerse = null;
+let BOOKS = [], cur = {osis:null, ch:1, name:''}, targetVerse = null, lastWord = null;
 const panel=$('#panel'), scrim=$('#scrim'), body=$('#pbody');
 function esc(s){return (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
@@ -487,7 +576,9 @@ async function init(){
   $('#prev').addEventListener('click',()=>{if(cur.ch>1){cur.ch--;syncChap();load();}});
   $('#next').addEventListener('click',()=>{const b=BOOKS.find(x=>x.osis===cur.osis); if(cur.ch<b.chapters){cur.ch++;syncChap();load();}});
   $('#pclose').addEventListener('click',close); scrim.addEventListener('click',close);
-  document.addEventListener('keydown',e=>{if(e.key==='Escape')close();});
+  $('#fbopen').addEventListener('click',openFb); $('#fbclose').addEventListener('click',closeFb);
+  $('#fbsend').addEventListener('click',sendFb);
+  document.addEventListener('keydown',e=>{if(e.key==='Escape'){close();closeFb();}});
 }
 function onBook(){ cur.osis=$('#book').value; const b=BOOKS.find(x=>x.osis===cur.osis); cur.name=b.name; cur.ch=1;
   const cs=$('#chap'); cs.innerHTML=''; for(let i=1;i<=b.chapters;i++){const o=document.createElement('option');o.value=i;o.textContent='Ch '+i;cs.appendChild(o);} load(); }
@@ -540,6 +631,7 @@ document.addEventListener('click',async e=>{
 async function showWord(strong){
   body.innerHTML='<div class="loading">Loading…</div>'; panel.classList.add('open'); scrim.classList.add('open');
   const w=await (await fetch('/api/word?strong='+encodeURIComponent(strong))).json();
+  lastWord={strong:strong, headword:(w.def&&w.def.headword)?w.def.headword:strong};
   const heb=strong[0]==='H';
   let h='<div class="pw '+(heb?'hbo':'grc')+'">'+esc(w.def&&w.def.headword?w.def.headword:strong)+'</div>';
   if(w.def&&w.def.translit) h+='<div class="ptr">'+esc(w.def.translit)+'</div>';
@@ -564,7 +656,17 @@ function jumpTo(pu){ // pu:OSIS.ch.vs(.title)
 }
 function onBookKeepChap(){ const b=BOOKS.find(x=>x.osis===cur.osis); const cs=$('#chap'); cs.innerHTML='';
   for(let i=1;i<=b.chapters;i++){const o=document.createElement('option');o.value=i;o.textContent='Ch '+i;cs.appendChild(o);} $('#chap').value=cur.ch; load(); }
-function close(){ panel.classList.remove('open'); scrim.classList.remove('open'); }
+function close(){ panel.classList.remove('open'); scrim.classList.remove('open'); lastWord=null; }
+function openFb(){ const w=lastWord;
+  $('#fbctx').textContent='On '+(cur.name||'')+' '+(cur.ch||'')+(w?(' · '+(w.headword||w.strong)):'');
+  $('#fbmsg').value=''; $('#fbbody').style.display=''; $('#fbdone').style.display='none'; $('#fbsend').disabled=false;
+  $('#fb').classList.add('open'); setTimeout(()=>$('#fbmsg').focus(),60); }
+function closeFb(){ $('#fb').classList.remove('open'); }
+async function sendFb(){ const c=$('#fbmsg').value.trim(); if(!c) return; $('#fbsend').disabled=true; const w=lastWord;
+  try{ await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({comment:c,book:cur.osis,chapter:cur.ch,ref:(cur.name||'')+' '+(cur.ch||''),strong:w?w.strong:'',word:w?(w.headword||''):'',pu:targetVerse||''})});
+    $('#fbbody').style.display='none'; $('#fbdone').style.display=''; setTimeout(closeFb,1200);
+  }catch(e){ $('#fbsend').disabled=false; } }
 init();
 """
 
@@ -573,8 +675,13 @@ PAGE = (
     "<meta name=viewport content='width=device-width,initial-scale=1'>"
     "<title>Source Text</title><style>" + CSS + "</style></head><body>"
     "<div id=scrim></div><aside id=panel><button id=pclose class=close>&times;</button><div id=pbody></div></aside>"
+    "<div id=fb><button id=fbclose class=close>&times;</button>"
+    "<div id=fbbody><h3>Send feedback</h3><div class=ctx id=fbctx></div>"
+    "<textarea id=fbmsg placeholder='What is working, what is confusing, what is missing...'></textarea>"
+    "<div class=row><span class=note>Goes only to Noah.</span><button class=send id=fbsend>Send</button></div></div>"
+    "<div id=fbdone class=done style='display:none'>Thanks, sent.</div></div>"
     "<div class=topbar><h1>Source Text</h1>"
-    "<select id=book></select><select id=chap></select>"
+    "<select id=book></select><select id=chap></select><button id=fbopen class=fbbtn>Feedback</button>"
     "<span class=nav><button id=prev>&larr;</button><span class=pg id=pg></span><button id=next>&rarr;</button></span>"
     "</div>"
     "<div class=wrap><h2 class=chapter-title id=ctitle></h2>"
