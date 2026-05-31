@@ -1,0 +1,5 @@
+*.sqlite
+*.sqlite-*
+.deploy/
+__pycache__/
+.DS_Store
