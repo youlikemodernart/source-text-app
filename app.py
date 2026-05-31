@@ -37,9 +37,35 @@ from urllib.parse import urlparse, parse_qs
 PROJECT = Path(__file__).resolve().parents[2]
 # DB path is env-overridable so the deployed instance can read a downloaded copy.
 DB = Path(os.environ.get("SOURCE_TEXT_DB", str(PROJECT / "data" / "build" / "source-text.translations.sqlite")))
-# Optional HTTP Basic Auth gate (set on the deployed instance; unset = open locally).
+# HTTP Basic Auth gate. Two ways to configure (both optional; unset both = open locally):
+#   AUTH_USER / AUTH_PASS  - a single shared login (back-compat with the first deploy).
+#   AUTH_USERS             - a per-tester roster, either JSON {"user": "pass", ...} or
+#                            "user:pass,user:pass". Supersedes/extends the single pair so
+#                            each tester gets a revocable login and the request is
+#                            attributable (used by the feedback slice later).
 AUTH_USER = os.environ.get("AUTH_USER")
 AUTH_PASS = os.environ.get("AUTH_PASS")
+
+
+def _load_auth_users() -> dict:
+    raw = (os.environ.get("AUTH_USERS") or "").strip()
+    users: dict[str, str] = {}
+    if raw.startswith("{"):
+        try:
+            users = {str(k): str(v) for k, v in json.loads(raw).items()}
+        except Exception:
+            users = {}
+    elif raw:
+        for pair in raw.split(","):
+            u, sep, pw = pair.strip().partition(":")
+            if sep and u:
+                users[u] = pw
+    if AUTH_USER and AUTH_PASS:
+        users.setdefault(AUTH_USER, AUTH_PASS)
+    return users
+
+
+AUTH_USERS = _load_auth_users()
 
 # Display order: formal -> dynamic, PD and internal interleaved by tradition.
 TRANS_ORDER = ["NASB", "NKJV", "KJV", "ASV", "YLT", "NIV", "NLT", "DRC", "CPDV", "JPS", "BRENTON"]
@@ -330,24 +356,33 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
                    "application/json; charset=utf-8")
 
-    def _authed(self) -> bool:
-        if not (AUTH_USER and AUTH_PASS):
-            return True  # no gate configured (local use)
+    def _auth_user(self):
+        """Return the authenticated username (str) or None to deny.
+
+        With no roster configured the gate is off (local use) and this returns ""
+        (an anonymous, allowed user). A configured roster requires valid Basic creds.
+        """
+        if not AUTH_USERS:
+            return ""  # gate off (local use)
         hdr = self.headers.get("Authorization", "")
         if not hdr.startswith("Basic "):
-            return False
+            return None
         try:
             user, _, pw = base64.b64decode(hdr[6:]).decode("utf-8").partition(":")
         except Exception:
-            return False
-        return (secrets.compare_digest(user, AUTH_USER) and secrets.compare_digest(pw, AUTH_PASS))
+            return None
+        expected = AUTH_USERS.get(user)
+        if expected is None:
+            secrets.compare_digest(pw, pw)  # even out timing for unknown users
+            return None
+        return user if secrets.compare_digest(pw, expected) else None
 
     def do_GET(self):
         u = urlparse(self.path)
         if u.path == "/healthz":   # unauthenticated liveness check (Render)
             self._send(200, b"ok", "text/plain")
             return
-        if not self._authed():
+        if self._auth_user() is None:
             self.send_response(401)
             self.send_header("WWW-Authenticate", 'Basic realm="Source Text"')
             self.send_header("Content-Length", "0")
@@ -565,7 +600,7 @@ def main():
     host = os.environ.get("HOST") or ("0.0.0.0" if os.environ.get("PORT") else "127.0.0.1")
     srv = ThreadingHTTPServer((host, port), Handler)
     url = f"http://{host}:{port}/"
-    gate = "ON" if (AUTH_USER and AUTH_PASS) else "OFF (open)"
+    gate = f"ON ({len(AUTH_USERS)} user{'' if len(AUTH_USERS) == 1 else 's'})" if AUTH_USERS else "OFF (open)"
     print(f"Source Text study app -> {url}  auth={gate}  db={DB}  (Ctrl-C to stop)")
     if args.open:
         webbrowser.open(f"http://127.0.0.1:{port}/")
