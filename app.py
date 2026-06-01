@@ -618,6 +618,15 @@ footer{color:var(--faint);font-size:12px;border-top:1px solid var(--line);paddin
 .rng{display:inline-block;font-size:9px;font-weight:600;color:var(--accent);background:#eef2f7;border-radius:4px;padding:1px 4px;margin-left:5px;vertical-align:middle;font-variant-numeric:tabular-nums}
 .tx.cont .tx-cont{color:var(--faint);font-size:12px;font-style:italic;padding:6px 0}
 .ncnote{color:var(--muted);font-size:12.5px;background:#fafafa;border:1px dashed var(--line);border-radius:8px;padding:8px 12px;margin:0 0 18px}
+/* mobile: 16px form controls prevent iOS focus-zoom; larger tap targets for touch */
+@media (max-width:600px){
+  .topbar select{font-size:16px;padding:6px 8px}
+  .topbar button{font-size:15px;padding:7px 11px}
+  .topbar .nav button{min-width:50px;min-height:38px}
+  #fb textarea{font-size:16px}
+  #fb button.send{font-size:15px;padding:8px 15px}
+  .tp-item{padding:8px 5px}
+}
 """
 
 JS = r"""
