@@ -75,8 +75,19 @@ FEEDBACK_PATH = Path(os.environ.get("FEEDBACK_PATH", str(PROJECT / "data" / "fee
 FEEDBACK_ADMIN = os.environ.get("FEEDBACK_ADMIN", "noah")
 _fb_lock = threading.Lock()
 
-# Display order: formal -> dynamic, PD and internal interleaved by tradition.
-TRANS_ORDER = ["NASB", "NKJV", "KJV", "ASV", "YLT", "NIV", "NLT", "DRC", "CPDV", "JPS", "BRENTON"]
+# Display order: formal -> amplified -> dynamic -> paraphrase, then by tradition.
+TRANS_ORDER = ["NASB", "NKJV", "KJV", "ASV", "YLT", "AMP", "NIV", "NLT", "GNT", "MSG",
+               "TPT", "DRC", "CPDV", "JPS", "BRENTON"]
+# Tradition grouping for the translation picker (the project's 4-tradition framing).
+TRADITION = {
+    "NASB": "Protestant", "NKJV": "Protestant", "KJV": "Protestant", "ASV": "Protestant",
+    "YLT": "Protestant", "AMP": "Protestant", "NIV": "Protestant", "NLT": "Protestant",
+    "GNT": "Protestant", "MSG": "Protestant", "TPT": "Protestant",
+    "DRC": "Catholic", "CPDV": "Catholic", "JPS": "Jewish", "BRENTON": "Orthodox",
+}
+# Display-only short labels where the internal code is long/awkward. The DB code
+# stays the stable join key (provenance, psalm remap); only the UI label changes.
+DISPLAY_ABBR = {"BRENTON": "LXX"}
 OCC_CAP = 120
 
 _local = threading.local()
@@ -111,6 +122,27 @@ def q_books() -> list[dict]:
         if r["osis_code"] in chap:
             out.append({"name": r["canonical_name"], "osis": r["osis_code"],
                         "testament": r["testament"], "chapters": chap[r["osis_code"]]})
+    return out
+
+
+def q_translations() -> list[dict]:
+    """Registry for the translation picker: code, name, internal flag, tradition, and
+    the set of book osis codes each translation actually covers. The coverage set lets
+    the UI show a graceful 'X does not cover {book}' note for partial translations
+    (TPT lacks 15 OT books) rather than a silent gap."""
+    c = con()
+    cover: dict[str, list] = {}
+    for r in c.execute("SELECT t.code, tv.book_code FROM translation_verse tv "
+                       "JOIN translation t ON t.id=tv.translation_id GROUP BY t.code, tv.book_code"):
+        cover.setdefault(r["code"], []).append(r["book_code"])
+    order = {code: i for i, code in enumerate(TRANS_ORDER)}
+    out = []
+    for r in c.execute("SELECT code, name, rights_status rs FROM translation"):
+        out.append({"code": r["code"], "abbr": DISPLAY_ABBR.get(r["code"], r["code"]),
+                    "name": r["name"], "internal": r["rs"] != "public-domain",
+                    "tradition": TRADITION.get(r["code"], "Other"),
+                    "books": sorted(cover.get(r["code"], []))})
+    out.sort(key=lambda x: order.get(x["code"], 99))
     return out
 
 
@@ -214,15 +246,25 @@ def _psalm_remap(c, pus: list[str]) -> dict:
 
 
 def _apply_psalm_remap(c, tx: dict, pus: list[str]):
-    """In-place: drop the Vulgate/LXX translations' natively-numbered Psalm rows
-    and replace them with text realigned to the English numbering via the map."""
+    """In-place: for the Vulgate/LXX translations whose Psalm numbering diverges,
+    replace their natively-numbered rows with text realigned to English numbering via
+    the TVTMS map. Where a Psalm does NOT diverge (e.g. Ps 1-8) there is no map entry,
+    so the native row is already English-aligned and is kept as-is (otherwise those
+    translations would silently vanish on the non-divergent Psalms)."""
     divergent = _divergent_codes(c)
     if not divergent:
         return
+    remap = _psalm_remap(c, pus)  # {(code, english_pu): realigned_text}
+    replaced: dict[str, set] = {}  # english_pu -> codes that have a remap replacement
+    for (code, epu) in remap:
+        replaced.setdefault(epu, set()).add(code)
+    # drop a divergent translation's native row only where a remap will replace it
     for pu in tx:
-        tx[pu] = [row for row in tx[pu] if row["code"] not in divergent]
+        drop = replaced.get(pu)
+        if drop:
+            tx[pu] = [row for row in tx[pu] if not (row["code"] in divergent and row["code"] in drop)]
     meta = _trans_meta(c)
-    for (code, english_pu), text in _psalm_remap(c, pus).items():
+    for (code, english_pu), text in remap.items():
         m = meta.get(code, {"name": code, "display_allowed": 0, "internal": True})
         tx.setdefault(english_pu, []).append(
             {"code": code, "name": m["name"], "display_allowed": m["display_allowed"],
@@ -239,12 +281,12 @@ def q_chapter(osis: str, ch: int) -> dict:
     # translations per pu
     tx: dict[str, list] = {}
     for r in c.execute(
-        f"SELECT tv.passage_unit_id pu, t.code, t.name, t.display_allowed da, t.rights_status rs, tv.text "
+        f"SELECT tv.passage_unit_id pu, t.code, t.name, t.display_allowed da, t.rights_status rs, tv.text, tv.verse_end vend "
         f"FROM translation_verse tv JOIN translation t ON t.id=tv.translation_id "
         f"WHERE tv.passage_unit_id IN ({ph})", pus):
         tx.setdefault(r["pu"], []).append(
             {"code": r["code"], "name": r["name"], "display_allowed": r["da"],
-             "internal": r["rs"] != "public-domain", "text": r["text"]})
+             "internal": r["rs"] != "public-domain", "text": r["text"], "verse_end": r["vend"]})
     if osis == "Ps":
         _apply_psalm_remap(c, tx, pus)
     originals = q_originals(c, pus)
@@ -255,9 +297,12 @@ def q_chapter(osis: str, ch: int) -> dict:
         rows = tx.get(pu, [])
         order = {code: i for i, code in enumerate(TRANS_ORDER)}
         rows.sort(key=lambda x: (order.get(x["code"], 99), x["code"]))
+        # The row label is the verse number only; merged paraphrase blocks (MSG/GNT/
+        # TPT) carry their range as a per-translation badge, so the row stays aligned
+        # to the verse spine even when one translation merges verses here.
         verses.append({
-            "pu": pu, "verse": r["verse"], "verse_end": r["vend"], "is_title": bool(r["is_title"]),
-            "label": "title" if r["is_title"] else (f'{r["verse"]}' + (f'-{r["vend"]}' if r["vend"] else "")),
+            "pu": pu, "verse": r["verse"], "is_title": bool(r["is_title"]),
+            "label": "title" if r["is_title"] else f'{r["verse"]}',
             "translations": rows, "original": originals.get(pu),
         })
     return {"book": bookname["canonical_name"] if bookname else osis, "osis": osis,
@@ -438,6 +483,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
             elif u.path == "/api/books":
                 self._json(q_books())
+            elif u.path == "/api/translations":
+                self._json(q_translations())
             elif u.path == "/api/chapter":
                 self._json(q_chapter(qs["book"][0], int(qs["ch"][0])))
             elif u.path == "/api/word":
@@ -554,16 +601,38 @@ footer{color:var(--faint);font-size:12px;border-top:1px solid var(--line);paddin
 #fb button.send{font:inherit;font-size:13px;padding:6px 13px;border:none;border-radius:8px;background:var(--accent);color:#fff;cursor:pointer}
 #fb button.send:disabled{opacity:.5;cursor:default}
 #fb .done{font-size:13px;color:var(--accent);padding:8px 2px}
+/* translation picker */
+#tpanel{position:fixed;top:52px;left:20px;z-index:12;background:#fff;border:1px solid var(--line);border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.16);padding:10px;max-height:74vh;overflow-y:auto;width:286px;max-width:92vw;display:none}
+#tpanel.open{display:block}
+.tp-actions{display:flex;gap:6px;margin-bottom:6px}
+.tp-actions button{flex:1;font:inherit;font-size:12px;padding:5px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--muted);cursor:pointer}
+.tp-actions button:hover{color:var(--ink);border-color:var(--accent)}
+.tp-group{font-size:10px;letter-spacing:.07em;text-transform:uppercase;color:var(--faint);margin:11px 4px 3px}
+.tp-item{display:flex;align-items:center;gap:9px;padding:6px 5px;border-radius:7px;cursor:pointer}
+.tp-item:hover{background:#f6f6f6}
+.tp-item input{width:16px;height:16px;flex:none;accent-color:var(--accent)}
+.tp-code{font-weight:600;font-size:13px;width:46px;flex:none}
+.tp-name{color:var(--muted);font-size:12px}
+.tp-name em{color:var(--internal);font-style:normal}
+/* range badge, continuation marker, partial-coverage note */
+.rng{display:inline-block;font-size:9px;font-weight:600;color:var(--accent);background:#eef2f7;border-radius:4px;padding:1px 4px;margin-left:5px;vertical-align:middle;font-variant-numeric:tabular-nums}
+.tx.cont .tx-cont{color:var(--faint);font-size:12px;font-style:italic;padding:6px 0}
+.ncnote{color:var(--muted);font-size:12.5px;background:#fafafa;border:1px dashed var(--line);border-radius:8px;padding:8px 12px;margin:0 0 18px}
 """
 
 JS = r"""
 const $ = s => document.querySelector(s);
 let BOOKS = [], cur = {osis:null, ch:1, name:''}, targetVerse = null, lastWord = null;
+let TRANS = [], SEL = new Set(), lastData = null, ABBR = {};
 const panel=$('#panel'), scrim=$('#scrim'), body=$('#pbody');
 function esc(s){return (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function disp(c){return ABBR[c]||c;}  // short display label for a translation code
 
 async function init(){
-  BOOKS = await (await fetch('/api/books')).json();
+  [BOOKS, TRANS] = await Promise.all([
+    fetch('/api/books').then(r=>r.json()), fetch('/api/translations').then(r=>r.json())]);
+  ABBR={}; TRANS.forEach(t=>ABBR[t.code]=t.abbr||t.code);
+  SEL = loadSel(); buildPicker(); updateTbtn();
   const bsel=$('#book');
   let og=null,lastT=null;
   for(const b of BOOKS){
@@ -576,10 +645,37 @@ async function init(){
   $('#prev').addEventListener('click',()=>{if(cur.ch>1){cur.ch--;syncChap();load();}});
   $('#next').addEventListener('click',()=>{const b=BOOKS.find(x=>x.osis===cur.osis); if(cur.ch<b.chapters){cur.ch++;syncChap();load();}});
   $('#pclose').addEventListener('click',close); scrim.addEventListener('click',close);
+  $('#tbtn').addEventListener('click',e=>{e.stopPropagation(); $('#tpanel').classList.toggle('open');});
+  document.addEventListener('click',e=>{ if(!e.target.closest('#tpanel')&&!e.target.closest('#tbtn')) $('#tpanel').classList.remove('open'); });
   $('#fbopen').addEventListener('click',openFb); $('#fbclose').addEventListener('click',closeFb);
   $('#fbsend').addEventListener('click',sendFb);
-  document.addEventListener('keydown',e=>{if(e.key==='Escape'){close();closeFb();}});
+  document.addEventListener('keydown',e=>{if(e.key==='Escape'){close();closeFb();$('#tpanel').classList.remove('open');}});
 }
+
+/* ---- translation picker ---- */
+function loadSel(){ try{ const s=JSON.parse(localStorage.getItem('st.sel'));
+  if(Array.isArray(s)&&s.length) return new Set(s.filter(c=>TRANS.some(t=>t.code===c))); }catch(e){}
+  return new Set(TRANS.map(t=>t.code)); }
+function persistSel(){ try{ localStorage.setItem('st.sel', JSON.stringify([...SEL])); }catch(e){} }
+function updateTbtn(){ $('#tbtn').textContent='Translations ('+SEL.size+'/'+TRANS.length+')'; }
+function buildPicker(){
+  const byTrad={}; for(const t of TRANS){ (byTrad[t.tradition]=byTrad[t.tradition]||[]).push(t); }
+  let h='<div class=tp-actions><button type=button id=tpall>All</button><button type=button id=tpnone>None</button></div>';
+  for(const trad of ['Protestant','Catholic','Jewish','Orthodox','Other']){
+    if(!byTrad[trad]) continue;
+    h+='<div class=tp-group>'+trad+'</div>';
+    for(const t of byTrad[trad])
+      h+='<label class=tp-item><input type=checkbox value="'+esc(t.code)+'"'+(SEL.has(t.code)?' checked':'')+
+         '><span class=tp-code>'+esc(disp(t.code))+'</span><span class=tp-name>'+esc(t.name)+(t.internal?' · <em>internal</em>':'')+'</span></label>';
+  }
+  const w=$('#tpanel'); w.innerHTML=h;
+  w.querySelectorAll('input[type=checkbox]').forEach(cb=>cb.addEventListener('change',()=>{
+    cb.checked?SEL.add(cb.value):SEL.delete(cb.value); afterSel(); }));
+  $('#tpall').addEventListener('click',()=>{ SEL=new Set(TRANS.map(t=>t.code)); syncPicker(); afterSel(); });
+  $('#tpnone').addEventListener('click',()=>{ SEL=new Set(); syncPicker(); afterSel(); });
+}
+function syncPicker(){ $('#tpanel').querySelectorAll('input[type=checkbox]').forEach(cb=>cb.checked=SEL.has(cb.value)); }
+function afterSel(){ persistSel(); updateTbtn(); if(lastData) render(lastData); }
 function onBook(){ cur.osis=$('#book').value; const b=BOOKS.find(x=>x.osis===cur.osis); cur.name=b.name; cur.ch=1;
   const cs=$('#chap'); cs.innerHTML=''; for(let i=1;i<=b.chapters;i++){const o=document.createElement('option');o.value=i;o.textContent='Ch '+i;cs.appendChild(o);} load(); }
 function syncChap(){ $('#chap').value=cur.ch; }
@@ -604,19 +700,37 @@ function tokenCell(t,lang){
     (t.strong?'<div class="meta">'+esc(t.strong)+'</div>':'')+'</div>';
 }
 function render(data){
+  lastData=data;
+  $('#ctitle').textContent=(data.book||cur.name||'')+' '+(data.chapter||cur.ch||'');
   if(!data.verses||!data.verses.length){ $('#reader').innerHTML='<div class="empty">No text for this chapter.</div>'; return; }
-  $('#ctitle').textContent=data.book+' '+data.chapter;
   let h='';
   if(data.osis==='Ps'){ h+='<div class="psnote">DRC, CPDV (Vulgate) and Brenton (Septuagint) number the Psalms differently; their text here is realigned to the English/Hebrew numbering via a TVTMS versification map, so every translation shows the same psalm.</div>'; }
+  if(!SEL.size){ $('#reader').innerHTML=h+'<div class="empty">No translations selected. Open <strong>Translations</strong> above to choose some.</div>'; return; }
+  // genuine coverage gaps only: a selected translation that covers other books of this
+  // testament but not this one (TPT lacks 15 OT books). Skip structural OT/NT absences
+  // (e.g. JPS/LXX have no NT) so the note doesn't nag on every chapter of the other testament.
+  const osisT={}; BOOKS.forEach(b=>osisT[b.osis]=b.testament); const bookT=osisT[data.osis];
+  const miss=TRANS.filter(t=>SEL.has(t.code) && !(t.books||[]).includes(data.osis)
+                 && (t.books||[]).some(bk=>osisT[bk]===bookT));
+  if(miss.length) h+='<div class="ncnote">'+miss.map(t=>esc(disp(t.code))).join(', ')+(miss.length===1?' does':' do')+' not cover '+esc(data.book)+'.</div>';
+  // continuation map: a merged paraphrase block (verse_end) also covers later verses
+  const conti={};
+  for(const v of data.verses) for(const tr of v.translations) if(tr.verse_end&&tr.verse_end>v.verse)
+    for(let k=v.verse+1;k<=tr.verse_end;k++){ (conti[k]=conti[k]||[]).push({code:tr.code,label:v.verse+'–'+tr.verse_end}); }
   for(const v of data.verses){
     h+='<div class="verse" data-pu="'+esc(v.pu)+'"><div class="vno'+(v.is_title?' title':'')+'">'+esc(v.label)+'</div><div>';
     if(v.original && v.original.tokens.length){
       h+='<div class="interlinear '+(v.original.lang==='hbo'?'rtl':'')+'">'+v.original.tokens.map(t=>tokenCell(t,v.original.lang)).join('')+'</div>';
     }
-    for(const tr of v.translations){
-      h+='<div class="tx"><div class="tx-code">'+esc(tr.code)+(tr.internal?'<span class="tag">internal</span>':'')+'</div>'+
+    const shown=v.translations.filter(tr=>SEL.has(tr.code));
+    for(const tr of shown){
+      const badge=tr.verse_end?'<span class="rng">'+v.verse+'–'+tr.verse_end+'</span>':'';
+      h+='<div class="tx"><div class="tx-code">'+esc(disp(tr.code))+badge+(tr.internal?'<span class="tag">internal</span>':'')+'</div>'+
          '<div class="tx-text'+(tr.internal?' internal':'')+'">'+esc(tr.text)+'</div></div>';
     }
+    const shownCodes=new Set(shown.map(t=>t.code));
+    for(const x of (conti[v.verse]||[])) if(SEL.has(x.code)&&!shownCodes.has(x.code))
+      h+='<div class="tx cont"><div class="tx-code">'+esc(disp(x.code))+'</div><div class="tx-cont">part of '+esc(x.label)+' ↑</div></div>';
     h+='</div></div>';
   }
   $('#reader').innerHTML=h;
@@ -681,15 +795,19 @@ PAGE = (
     "<div class=row><span class=note>Goes only to Noah.</span><button class=send id=fbsend>Send</button></div></div>"
     "<div id=fbdone class=done style='display:none'>Thanks, sent.</div></div>"
     "<div class=topbar><h1>Source Text</h1>"
-    "<select id=book></select><select id=chap></select><button id=fbopen class=fbbtn>Feedback</button>"
+    "<select id=book></select><select id=chap></select>"
+    "<button id=tbtn class=fbbtn>Translations</button>"
+    "<button id=fbopen class=fbbtn>Feedback</button>"
     "<span class=nav><button id=prev>&larr;</button><span class=pg id=pg></span><button id=next>&rarr;</button></span>"
-    "</div>"
+    "</div><div id=tpanel></div>"
     "<div class=wrap><h2 class=chapter-title id=ctitle></h2>"
     "<p class=hint>Click any Greek or Hebrew word for its Strong’s definition and every occurrence across the whole corpus. "
-    "Public-domain translations shown plainly; the four copyrighted ones are tagged <em>internal</em> (personal use).</p>"
+    "Use <em>Translations</em> to choose which versions appear; public-domain ones show plainly, copyrighted ones are tagged "
+    "<em>internal</em> (personal use).</p>"
     "<div id=reader></div>"
-    "<footer>Local study app over source-text.translations.sqlite — 11 translations, full Greek NT + Hebrew OT with Strong’s. "
-    "Sources: STEPBible TAGNT/TAHOT/TBESG/TBESH (CC BY 4.0); public-domain translations; NASB/NIV/NLT/NKJV internal.</footer></div>"
+    "<footer>Local study app over source-text.translations.sqlite — 15 translations across 4 traditions, full Greek NT + Hebrew OT with Strong’s. "
+    "Sources: STEPBible TAGNT/TAHOT/TBESG/TBESH (CC BY 4.0); public-domain translations; copyrighted translations "
+    "(NASB/NIV/NLT/NKJV/AMP/MSG/GNT/TPT) internal.</footer></div>"
     "<script>" + JS + "</script></body></html>"
 )
 
