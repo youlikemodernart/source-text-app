@@ -529,7 +529,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 CSS = """
-:root{--ink:#1c1c1c;--muted:#6f6f6f;--faint:#9a9a9a;--line:#e7e7e7;--bg:#fff;--rootbg:#eef2f5;--accent:#2a5d8f;--internal:#b06a00;--sel:#fff3cd}
+:root{--ink:#1c1c1c;--muted:#6f6f6f;--faint:#9a9a9a;--line:#e7e7e7;--bg:#fff;--rootbg:#eef2f5;--accent:#2a5d8f;--internal:#b06a00;--sel:#fff3cd;--tbscale:1}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;line-height:1.5;-webkit-font-smoothing:antialiased}
 .topbar{position:sticky;top:0;z-index:8;background:rgba(255,255,255,.94);backdrop-filter:saturate(180%) blur(8px);border-bottom:1px solid var(--line);padding:10px 20px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
@@ -537,6 +537,7 @@ body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,Bl
 .topbar select,.topbar button{font:inherit;font-size:13px;padding:5px 8px;border:1px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);cursor:pointer}
 .topbar .nav{margin-left:auto;display:flex;gap:6px;align-items:center}
 .topbar .nav .pg{color:var(--faint);font-size:12px;min-width:74px;text-align:center}
+.pgshort{display:none}
 .wrap{max-width:880px;margin:0 auto;padding:28px 24px 160px}
 .chapter-title{font-size:24px;font-weight:600;margin:6px 0 22px}
 .verse{display:grid;grid-template-columns:34px 1fr;gap:8px;padding:18px 0;border-top:1px solid var(--line)}
@@ -618,15 +619,41 @@ footer{color:var(--faint);font-size:12px;border-top:1px solid var(--line);paddin
 .rng{display:inline-block;font-size:9px;font-weight:600;color:var(--accent);background:#eef2f7;border-radius:4px;padding:1px 4px;margin-left:5px;vertical-align:middle;font-variant-numeric:tabular-nums}
 .tx.cont .tx-cont{color:var(--faint);font-size:12px;font-style:italic;padding:6px 0}
 .ncnote{color:var(--muted);font-size:12.5px;background:#fafafa;border:1px dashed var(--line);border-radius:8px;padding:8px 12px;margin:0 0 18px}
-/* mobile: 16px form controls prevent iOS focus-zoom; larger tap targets for touch */
+/* mobile reading header: reclaim vertical space; >=38px tap targets + 16px controls (no iOS zoom) */
 @media (max-width:600px){
-  .topbar select{font-size:16px;padding:6px 8px}
-  .topbar button{font-size:15px;padding:7px 11px}
-  .topbar .nav button{min-width:50px;min-height:38px}
+  .topbar{padding:7px 12px;gap:7px}
+  .topbar h1{display:none}                                      /* brand hidden by default on phone */
+  body.show-brand .topbar h1{display:block;font-size:13px;margin:0 6px 0 0}
+  .topbar select{font-size:calc(16px*var(--tbscale));padding:6px 8px;min-height:calc(38px*var(--tbscale));flex:1 1 auto;min-width:0}
+  .topbar #chap{flex:0 1 auto;max-width:36%}
+  .topbar #tbtn{font-size:calc(13px*var(--tbscale));padding:7px 9px;min-height:calc(38px*var(--tbscale))}
+  .topbar #tbtn .tbtn-full{display:none}   /* mobile: show just the count so row 1 stays to the two selects */
+  .topbar #fbopen{display:none}                                 /* Feedback -> floating launcher */
+  .topbar .nav{flex-basis:100%;margin-left:0;justify-content:flex-end;min-height:38px;gap:8px}
+  .topbar .nav button{min-width:46px;min-height:calc(38px*var(--tbscale));font-size:calc(16px*var(--tbscale))}
+  .topbar .nav .pg{min-width:0;font-size:calc(12px*var(--tbscale))}
+  body.lbl-chap .pgfull{display:none} body.lbl-chap .pgshort{display:inline}
+  body.lbl-off .topbar .nav .pg{display:none}
+  /* single-row option: one line, selects shrink, page label goes short */
+  body.onerow .topbar{flex-wrap:nowrap}
+  body.onerow .topbar .nav{flex-basis:auto;margin-left:auto}
+  body.onerow #tbtn .tbtn-full{display:none}
+  body.onerow .pgfull{display:none} body.onerow .pgshort{display:inline}
   #fb textarea{font-size:16px}
   #fb button.send{font-size:15px;padding:8px 15px}
   .tp-item{padding:8px 5px}
+  body #fbfloat{display:inline-flex}   /* beat the later base #fbfloat{display:none} (equal-specificity source-order) */
 }
+/* floating feedback launcher (mobile only; desktop keeps the header button) */
+#fbfloat{display:none;position:fixed;left:14px;bottom:16px;z-index:11;align-items:center;gap:6px;font:inherit;font-size:13px;padding:8px 13px;min-height:38px;border:1px solid var(--line);border-radius:20px;background:rgba(255,255,255,.94);backdrop-filter:saturate(180%) blur(8px);color:var(--muted);box-shadow:0 3px 14px rgba(0,0,0,.10);cursor:pointer}
+/* header dev bar (gated by ?dev): tune the mobile header on-device, no redeploy */
+#hdrdev{display:none;position:fixed;left:0;right:0;bottom:0;z-index:30;background:#1c1c1c;color:#eee;font:inherit;font-size:12px;padding:8px 10px;gap:8px;flex-wrap:wrap;align-items:center;box-shadow:0 -4px 20px rgba(0,0,0,.3)}
+#hdrdev.open{display:flex}
+#hdrdev b{font-weight:600;color:#fff;margin-right:2px}
+#hdrdev .seg{display:flex;border:1px solid #444;border-radius:7px;overflow:hidden}
+#hdrdev .seg button{font:inherit;font-size:12px;padding:6px 10px;min-height:34px;border:none;background:#2a2a2a;color:#bbb;cursor:pointer}
+#hdrdev .seg button.on{background:var(--accent);color:#fff}
+#hdrdev .cfg{margin-left:auto;color:#9a9a9a;font-family:ui-monospace,Menlo,monospace;font-size:11px}
 """
 
 JS = r"""
@@ -638,6 +665,7 @@ function esc(s){return (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;'
 function disp(c){return ABBR[c]||c;}  // short display label for a translation code
 
 async function init(){
+  loadHdr();
   [BOOKS, TRANS] = await Promise.all([
     fetch('/api/books').then(r=>r.json()), fetch('/api/translations').then(r=>r.json())]);
   ABBR={}; TRANS.forEach(t=>ABBR[t.code]=t.abbr||t.code);
@@ -659,6 +687,8 @@ async function init(){
   $('#fbopen').addEventListener('click',openFb); $('#fbclose').addEventListener('click',closeFb);
   $('#fbsend').addEventListener('click',sendFb);
   document.addEventListener('keydown',e=>{if(e.key==='Escape'){close();closeFb();$('#tpanel').classList.remove('open');}});
+  $('#fbfloat').addEventListener('click',openFb);
+  setupHdrDev(); applyHdr();
 }
 
 /* ---- translation picker ---- */
@@ -666,7 +696,7 @@ function loadSel(){ try{ const s=JSON.parse(localStorage.getItem('st.sel'));
   if(Array.isArray(s)&&s.length) return new Set(s.filter(c=>TRANS.some(t=>t.code===c))); }catch(e){}
   return new Set(TRANS.map(t=>t.code)); }
 function persistSel(){ try{ localStorage.setItem('st.sel', JSON.stringify([...SEL])); }catch(e){} }
-function updateTbtn(){ $('#tbtn').textContent='Translations ('+SEL.size+'/'+TRANS.length+')'; }
+function updateTbtn(){ $('#tbtn').innerHTML='<span class=tbtn-full>Translations </span><span class=tbtn-n>'+SEL.size+'/'+TRANS.length+'</span>'; }
 function buildPicker(){
   const byTrad={}; for(const t of TRANS){ (byTrad[t.tradition]=byTrad[t.tradition]||[]).push(t); }
   let h='<div class=tp-actions><button type=button id=tpall>All</button><button type=button id=tpnone>None</button></div>';
@@ -686,9 +716,9 @@ function buildPicker(){
 function syncPicker(){ $('#tpanel').querySelectorAll('input[type=checkbox]').forEach(cb=>cb.checked=SEL.has(cb.value)); }
 function afterSel(){ persistSel(); updateTbtn(); if(lastData) render(lastData); }
 function onBook(){ cur.osis=$('#book').value; const b=BOOKS.find(x=>x.osis===cur.osis); cur.name=b.name; cur.ch=1;
-  const cs=$('#chap'); cs.innerHTML=''; for(let i=1;i<=b.chapters;i++){const o=document.createElement('option');o.value=i;o.textContent='Ch '+i;cs.appendChild(o);} load(); }
+  const cs=$('#chap'); cs.innerHTML=''; for(let i=1;i<=b.chapters;i++){const o=document.createElement('option');o.value=i;o.textContent=i;cs.appendChild(o);} load(); }
 function syncChap(){ $('#chap').value=cur.ch; }
-function setNav(){ const b=BOOKS.find(x=>x.osis===cur.osis); $('#pg').textContent=cur.name+' '+cur.ch+' / '+b.chapters; }
+function setNav(){ const b=BOOKS.find(x=>x.osis===cur.osis); $('#pg').innerHTML='<span class=pgfull>'+esc(cur.name)+' '+cur.ch+' / '+b.chapters+'</span><span class=pgshort>'+cur.ch+'/'+b.chapters+'</span>'; }
 
 async function load(){
   setNav();
@@ -778,7 +808,7 @@ function jumpTo(pu){ // pu:OSIS.ch.vs(.title)
   $('#book').value=osis; onBookKeepChap();
 }
 function onBookKeepChap(){ const b=BOOKS.find(x=>x.osis===cur.osis); const cs=$('#chap'); cs.innerHTML='';
-  for(let i=1;i<=b.chapters;i++){const o=document.createElement('option');o.value=i;o.textContent='Ch '+i;cs.appendChild(o);} $('#chap').value=cur.ch; load(); }
+  for(let i=1;i<=b.chapters;i++){const o=document.createElement('option');o.value=i;o.textContent=i;cs.appendChild(o);} $('#chap').value=cur.ch; load(); }
 function close(){ panel.classList.remove('open'); scrim.classList.remove('open'); lastWord=null; }
 function openFb(){ const w=lastWord;
   $('#fbctx').textContent='On '+(cur.name||'')+' '+(cur.ch||'')+(w?(' · '+(w.headword||w.strong)):'');
@@ -790,6 +820,31 @@ async function sendFb(){ const c=$('#fbmsg').value.trim(); if(!c) return; $('#fb
     body:JSON.stringify({comment:c,book:cur.osis,chapter:cur.ch,ref:(cur.name||'')+' '+(cur.ch||''),strong:w?w.strong:'',word:w?(w.headword||''):'',pu:targetVerse||''})});
     $('#fbbody').style.display='none'; $('#fbdone').style.display=''; setTimeout(closeFb,1200);
   }catch(e){ $('#fbsend').disabled=false; } }
+/* ---- mobile header prefs + dev bar (gated by ?dev) ---- */
+const HDR={onerow:1,brand:0,label:'off',scale:1};  // baked mobile default (Noah 2026-06-07): single row, no brand, no nav label (chapter reads from the dropdown)
+function loadHdr(){ try{Object.assign(HDR,JSON.parse(localStorage.getItem('st.hdr')||'{}'));}catch(e){} }
+function applyHdr(){
+  const b=document.body.classList;
+  b.toggle('onerow',!!HDR.onerow); b.toggle('show-brand',!!HDR.brand);
+  b.toggle('lbl-chap',HDR.label==='chap'); b.toggle('lbl-off',HDR.label==='off');
+  document.documentElement.style.setProperty('--tbscale',HDR.scale);
+  const cfg=$('#hdrcfg'); if(cfg) cfg.textContent='row='+(HDR.onerow?'1':'2')+'  brand='+(HDR.brand?'on':'off')+'  label='+HDR.label+'  scale='+(+HDR.scale).toFixed(2);
+  document.querySelectorAll('#hdrdev button[data-k]').forEach(btn=>{ const k=btn.dataset.k,v=btn.dataset.v; let on=false;
+    if(k==='onerow')on=(HDR.onerow?'1':'0')===v; else if(k==='brand')on=(HDR.brand?'1':'0')===v; else if(k==='label')on=HDR.label===v;
+    btn.classList.toggle('on',on); });
+}
+function saveHdr(){ try{localStorage.setItem('st.hdr',JSON.stringify(HDR));}catch(e){} applyHdr(); }
+function setupHdrDev(){
+  if(!/[?&]dev\b/.test(location.search)) return;  // tuner shows only with ?dev in the URL; never persisted, so normal use is clean
+  $('#hdrdev').classList.add('open');
+  $('#hdrdev').addEventListener('click',e=>{ const btn=e.target.closest('button[data-k]'); if(!btn)return;
+    const k=btn.dataset.k,v=btn.dataset.v;
+    if(k==='onerow')HDR.onerow=v==='1'?1:0;
+    else if(k==='brand')HDR.brand=v==='1'?1:0;
+    else if(k==='label')HDR.label=v;
+    else if(k==='scale')HDR.scale=Math.min(1.4,Math.max(1,+(HDR.scale+(v==='up'?0.04:-0.04)).toFixed(2)));
+    saveHdr(); });
+}
 init();
 """
 
@@ -809,6 +864,13 @@ PAGE = (
     "<button id=fbopen class=fbbtn>Feedback</button>"
     "<span class=nav><button id=prev>&larr;</button><span class=pg id=pg></span><button id=next>&rarr;</button></span>"
     "</div><div id=tpanel></div>"
+    "<button id=fbfloat>Feedback</button>"
+    "<div id=hdrdev><b>Header</b>"
+    "<span class=seg><button data-k=onerow data-v=0>2-row</button><button data-k=onerow data-v=1>1-row</button></span>"
+    "<span class=seg><button data-k=brand data-v=0>No brand</button><button data-k=brand data-v=1>Brand</button></span>"
+    "<span class=seg><button data-k=label data-v=full>Full</button><button data-k=label data-v=chap>Ch</button><button data-k=label data-v=off>Off</button></span>"
+    "<span class=seg><button data-k=scale data-v=down>A-</button><button data-k=scale data-v=up>A+</button></span>"
+    "<span class=cfg id=hdrcfg></span></div>"
     "<div class=wrap><h2 class=chapter-title id=ctitle></h2>"
     "<p class=hint>Click any Greek or Hebrew word for its Strong’s definition and every occurrence across the whole corpus. "
     "Use <em>Translations</em> to choose which versions appear; public-domain ones show plainly, copyrighted ones are tagged "
