@@ -564,6 +564,8 @@ body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,Bl
 .tx-text.internal{color:#555}
 .empty{color:var(--faint);font-size:14px;padding:40px 0}
 .hint{color:var(--faint);font-size:12px;margin:0 0 20px}
+.hint-seen .hint{display:none}              /* intro shows on first visit only */
+.tbtn-ic{display:none;line-height:0}        /* layers glyph on the Translations button (mobile) */
 .psnote{background:#fbf6ee;border:1px solid #ead9bd;border-radius:8px;padding:10px 13px;color:#7a6024;font-size:12.5px;line-height:1.5;margin:0 0 22px}
 /* word panel */
 #scrim{position:fixed;inset:0;background:rgba(0,0,0,.18);opacity:0;pointer-events:none;transition:opacity .15s;z-index:9}
@@ -626,8 +628,9 @@ footer{color:var(--faint);font-size:12px;border-top:1px solid var(--line);paddin
   body.show-brand .topbar h1{display:block;font-size:13px;margin:0 6px 0 0}
   .topbar select{font-size:calc(16px*var(--tbscale));padding:6px 8px;min-height:calc(38px*var(--tbscale));flex:1 1 auto;min-width:0}
   .topbar #chap{flex:0 1 auto;max-width:36%}
-  .topbar #tbtn{font-size:calc(13px*var(--tbscale));padding:7px 9px;min-height:calc(38px*var(--tbscale))}
+  .topbar #tbtn{font-size:calc(13px*var(--tbscale));padding:7px 9px;min-height:calc(38px*var(--tbscale));display:inline-flex;align-items:center;gap:4px}
   .topbar #tbtn .tbtn-full{display:none}   /* mobile: show just the count so row 1 stays to the two selects */
+  .topbar #tbtn .tbtn-ic{display:inline-flex}   /* ...with a layers glyph so the count reads as versions */
   .topbar #fbopen{display:none}                                 /* Feedback -> floating launcher */
   .topbar .nav{flex-basis:100%;margin-left:0;justify-content:flex-end;min-height:38px;gap:8px}
   .topbar .nav button{min-width:46px;min-height:calc(38px*var(--tbscale));font-size:calc(16px*var(--tbscale))}
@@ -696,7 +699,7 @@ function loadSel(){ try{ const s=JSON.parse(localStorage.getItem('st.sel'));
   if(Array.isArray(s)&&s.length) return new Set(s.filter(c=>TRANS.some(t=>t.code===c))); }catch(e){}
   return new Set(TRANS.map(t=>t.code)); }
 function persistSel(){ try{ localStorage.setItem('st.sel', JSON.stringify([...SEL])); }catch(e){} }
-function updateTbtn(){ $('#tbtn').innerHTML='<span class=tbtn-full>Translations </span><span class=tbtn-n>'+SEL.size+'/'+TRANS.length+'</span>'; }
+function updateTbtn(){ $('#tbtn').innerHTML='<span class=tbtn-ic><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg></span><span class=tbtn-full>Translations </span><span class=tbtn-n>'+SEL.size+'/'+TRANS.length+'</span>'; }
 function buildPicker(){
   const byTrad={}; for(const t of TRANS){ (byTrad[t.tradition]=byTrad[t.tradition]||[]).push(t); }
   let h='<div class=tp-actions><button type=button id=tpall>All</button><button type=button id=tpnone>None</button></div>';
@@ -851,7 +854,9 @@ init();
 PAGE = (
     "<!doctype html><html lang=en><head><meta charset=utf-8>"
     "<meta name=viewport content='width=device-width,initial-scale=1'>"
-    "<title>Source Text</title><style>" + CSS + "</style></head><body>"
+    "<title>Source Text</title><style>" + CSS + "</style>"
+    "<script>try{if(localStorage.getItem('st.hintseen'))document.documentElement.classList.add('hint-seen');else localStorage.setItem('st.hintseen','1');}catch(e){}</script>"
+    "</head><body>"
     "<div id=scrim></div><aside id=panel><button id=pclose class=close>&times;</button><div id=pbody></div></aside>"
     "<div id=fb><button id=fbclose class=close>&times;</button>"
     "<div id=fbbody><h3>Send feedback</h3><div class=ctx id=fbctx></div>"
