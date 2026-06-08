@@ -305,6 +305,15 @@ def q_chapter(osis: str, ch: int) -> dict:
             "label": "title" if r["is_title"] else f'{r["verse"]}',
             "translations": rows, "original": originals.get(pu),
         })
+    # rung-7 interpretation layer: how many commentary entries each verse has, so the
+    # reader can show a quiet per-verse affordance (loaded on demand, never by default)
+    comm: dict[str, int] = {}
+    for r in c.execute(f"SELECT passage_unit_id pu, COUNT(*) n FROM interpretive_claim "
+                       f"WHERE claim_type='commentary' AND passage_unit_id IN ({ph}) "
+                       f"GROUP BY passage_unit_id", pus):
+        comm[r["pu"]] = r["n"]
+    for v in verses:
+        v["comm"] = comm.get(v["pu"], 0)
     return {"book": bookname["canonical_name"] if bookname else osis, "osis": osis,
             "chapter": ch, "verses": verses}
 
@@ -345,6 +354,21 @@ def q_word(strong: str) -> dict:
         (strong, strong)).fetchall()
     items = [{"pu": r["pu"], "ref": r["ref"], "surf": r["surf"]} for r in occ]
     return {"strong": strong, "def": _lex_for(c, strong), "total": len(items), "items": items[:OCC_CAP]}
+
+
+def q_commentary(pu: str) -> dict:
+    """Rung-7 interpretation layer: public-domain commentary for one verse, each
+    entry attributed to its author, tradition, and era (see docs/fidelity-principle.md)."""
+    c = con()
+    rows = c.execute(
+        "SELECT sw.title, sw.author, sw.tradition, sw.date_label, ic.claim_text "
+        "FROM interpretive_claim ic JOIN source_work sw ON sw.id=ic.source_work_id "
+        "WHERE ic.passage_unit_id=? AND ic.claim_type='commentary' ORDER BY sw.id",
+        (pu,)).fetchall()
+    ref = c.execute("SELECT canonical_start ref FROM passage_unit WHERE id=?", (pu,)).fetchone()
+    return {"pu": pu, "ref": ref["ref"] if ref else pu,
+            "entries": [{"title": r["title"], "author": r["author"], "tradition": r["tradition"],
+                         "date": r["date_label"], "text": r["claim_text"]} for r in rows]}
 
 
 def q_verse(pu: str) -> dict:
@@ -491,6 +515,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(q_word(qs["strong"][0]))
             elif u.path == "/api/verse":
                 self._json(q_verse(qs["pu"][0]))
+            elif u.path == "/api/commentary":
+                self._json(q_commentary(qs["pu"][0]))
             elif u.path == "/api/feedback":  # admin-only read
                 if self._auth_user() != FEEDBACK_ADMIN:
                     self._send(403, json.dumps({"error": "forbidden"}).encode(), "application/json")
@@ -589,6 +615,16 @@ body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,Bl
 #panel .occ .osurf{font-family:"New Athena Unicode","SBL Hebrew","Times New Roman",serif;color:var(--muted)}
 #panel .rights{font-size:11px;color:var(--internal);margin-top:10px;line-height:1.5}
 #panel .loading{color:var(--faint);font-size:13px;margin-top:20px}
+/* commentary (rung-7 interpretation layer): quiet per-verse affordance + attributed cards */
+.cnote{margin-top:10px;font:inherit;font-size:12px;padding:4px 11px;border:1px solid var(--line);border-radius:14px;background:#fff;color:var(--muted);cursor:pointer}
+.cnote:hover{color:var(--accent);border-color:var(--accent)}
+#panel .chint{font-size:12px;color:var(--faint);line-height:1.5;margin:12px 0 2px}
+#panel .ccard{border-top:1px solid var(--line);padding:14px 0 2px;margin-top:6px}
+#panel .cmeta{display:flex;flex-wrap:wrap;gap:8px;align-items:baseline;margin-bottom:6px}
+#panel .cmeta .cauth{font-weight:600;font-size:13px;color:var(--ink)}
+#panel .cmeta .ctrad{font-size:11px;color:var(--accent)}
+#panel .cmeta .cdate{font-size:11px;color:var(--faint);font-variant-numeric:tabular-nums}
+#panel .ctext{font-size:13px;line-height:1.6;color:#333}
 footer{color:var(--faint);font-size:12px;border-top:1px solid var(--line);padding-top:18px;margin-top:40px}
 /* feedback */
 .fbbtn{font:inherit;font-size:12px;padding:5px 9px;border:1px solid var(--line);border-radius:7px;background:#fff;color:var(--muted);cursor:pointer}
@@ -645,6 +681,9 @@ footer{color:var(--faint);font-size:12px;border-top:1px solid var(--line);paddin
   #fb textarea{font-size:16px}
   #fb button.send{font-size:15px;padding:8px 15px}
   .tp-item{padding:8px 5px}
+  .cnote{min-height:40px;padding:9px 14px;display:inline-flex;align-items:center;font-size:12.5px;border-radius:20px}   /* commentary affordance = real tap target on phone (>=40px) */
+  #panel .close{top:6px;right:8px;width:40px;height:40px;display:flex;align-items:center;justify-content:center}   /* 40px hit area, glyph stays in the corner */
+  #fb .close{top:2px;right:4px;width:40px;height:40px;display:flex;align-items:center;justify-content:center}
   body #fbfloat{display:inline-flex}   /* beat the later base #fbfloat{display:none} (equal-specificity source-order) */
 }
 /* floating feedback launcher (mobile only; desktop keeps the header button) */
@@ -773,6 +812,7 @@ function render(data){
     const shownCodes=new Set(shown.map(t=>t.code));
     for(const x of (conti[v.verse]||[])) if(SEL.has(x.code)&&!shownCodes.has(x.code))
       h+='<div class="tx cont"><div class="tx-code">'+esc(disp(x.code))+'</div><div class="tx-cont">part of '+esc(x.label)+' ↑</div></div>';
+    if(v.comm) h+='<button class=cnote data-pu="'+esc(v.pu)+'">Commentary · '+v.comm+'</button>';
     h+='</div></div>';
   }
   $('#reader').innerHTML=h;
@@ -782,7 +822,9 @@ document.addEventListener('click',async e=>{
   const w=e.target.closest('.w[data-strong]');
   if(w && w.getAttribute('data-strong')){ showWord(w.getAttribute('data-strong')); return; }
   const o=e.target.closest('.o[data-pu]');
-  if(o){ jumpTo(o.getAttribute('data-pu')); }
+  if(o){ jumpTo(o.getAttribute('data-pu')); return; }
+  const cn=e.target.closest('.cnote[data-pu]');
+  if(cn){ showCommentary(cn.getAttribute('data-pu')); }
 });
 async function showWord(strong){
   body.innerHTML='<div class="loading">Loading…</div>'; panel.classList.add('open'); scrim.classList.add('open');
@@ -801,6 +843,19 @@ async function showWord(strong){
   h+='<h4>Appears '+w.total+' time'+(w.total===1?'':'s')+(w.total>w.items.length?' (showing '+w.items.length+')':'')+'</h4><div class="occ">';
   for(const o of w.items){ h+='<div class="o" data-pu="'+esc(o.pu)+'"><span class="oref">'+esc(o.ref)+' ›</span><span class="osurf">'+esc(o.surf)+'</span></div>'; }
   h+='</div>';
+  body.innerHTML=h; panel.scrollTop=0;
+}
+async function showCommentary(pu){
+  body.innerHTML='<div class="loading">Loading…</div>'; panel.classList.add('open'); scrim.classList.add('open'); lastWord=null;
+  const d=await (await fetch('/api/commentary?pu='+encodeURIComponent(pu))).json();
+  let h='<div class="pw" style="font-size:20px">'+esc(d.ref||'')+'</div><div class="pmeta">Commentary · public domain</div>';
+  h+='<p class="chint">What these commentators said about this verse. Each entry is one named voice in its own tradition and time.</p>';
+  for(const e of (d.entries||[])){
+    h+='<div class="ccard"><div class="cmeta"><span class="cauth">'+esc(e.author||e.title||'')+'</span>'+
+       (e.tradition?'<span class="ctrad">'+esc(e.tradition)+'</span>':'')+(e.date?'<span class="cdate">'+esc(e.date)+'</span>':'')+'</div>'+
+       '<div class="ctext">'+esc(e.text||'').replace(/\n{2,}/g,'<br><br>').replace(/\n/g,' ')+'</div></div>';
+  }
+  if(!d.entries||!d.entries.length) h+='<div class="pentry">No commentary for this verse yet.</div>';
   body.innerHTML=h; panel.scrollTop=0;
 }
 function jumpTo(pu){ // pu:OSIS.ch.vs(.title)
