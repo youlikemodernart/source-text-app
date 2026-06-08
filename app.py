@@ -627,7 +627,7 @@ footer{color:var(--faint);font-size:12px;border-top:1px solid var(--line);paddin
   .topbar h1{display:none}                                      /* brand hidden by default on phone */
   body.show-brand .topbar h1{display:block;font-size:13px;margin:0 6px 0 0}
   .topbar select{font-size:calc(16px*var(--tbscale));padding:6px 8px;min-height:calc(38px*var(--tbscale));flex:1 1 auto;min-width:0}
-  .topbar #chap{flex:0 1 auto;max-width:36%}
+  .topbar #chap{flex:0 0 auto;min-width:60px}   /* don't shrink below its widest value: chapters go to 150 (3 digits + chevron) */
   .topbar #tbtn{font-size:calc(13px*var(--tbscale));padding:7px 9px;min-height:calc(38px*var(--tbscale));display:inline-flex;align-items:center;gap:4px}
   .topbar #tbtn .tbtn-full{display:none}   /* mobile: show just the count so row 1 stays to the two selects */
   .topbar #tbtn .tbtn-ic{display:inline-flex}   /* ...with a layers glyph so the count reads as versions */
