@@ -338,7 +338,78 @@ def _lex_for(c, strong: str):
             "entry": format_lex_html(entry), "gated": gated}
 
 
-def q_word(strong: str) -> dict:
+_HEB_MARKS = re.compile(r"[\u0591-\u05C7]")
+
+
+def _cons(s: str) -> str:
+    """Hebrew consonants only (no vowels/cantillation/maqaf/sof pasuq)."""
+    return _HEB_MARKS.sub("", s or "").replace("\u05be", " ").replace("/", "").strip()
+
+
+def _has_table(c, name: str) -> bool:
+    return bool(c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone())
+
+
+def q_hebrew_depth(c, strong: str, pu: str, surface: str, headword: str) -> dict:
+    """Evidence beyond Strong's for one Hebrew word, optionally in the context of one verse:
+    SDBH meanings (with the one assigned at this verse), Septuagint renderings (overall and
+    here), full BDB, Sefaria's Jastrow/Klein/BDB, and Jewish commentators' remarks on this
+    word in this verse. Each block stays attributed to its source."""
+    base = base_strong(strong)
+    out: dict = {}
+    if _has_table(c, "sdbh_meaning"):
+        here = set()
+        if pu:
+            here = {r[0] for r in c.execute(
+                "SELECT r.meaning_id FROM sdbh_ref r JOIN sdbh_meaning m ON m.id=r.meaning_id "
+                "WHERE r.passage_unit_id=? AND m.strong_base=?", (pu, base))}
+        ms = []
+        for r in c.execute("SELECT id, lemma, pos, definition, glosses, domains, synonyms, antonyms, links, notes, n_refs "
+                           "FROM sdbh_meaning WHERE strong_base=? ORDER BY ord", (base,)):
+            ms.append({"id": r[0], "lemma": r[1], "pos": r[2], "def": r[3], "glosses": json.loads(r[4] or "[]"),
+                       "domains": json.loads(r[5] or "[]"), "syn": json.loads(r[6] or "[]"),
+                       "ant": json.loads(r[7] or "[]"), "links": json.loads(r[8] or "[]"), "notes": r[9] or "",
+                       "n": r[10], "here": r[0] in here})
+        out["sdbh"] = ms
+    if _has_table(c, "lxx_rendering"):
+        rows = c.execute("SELECT greek_key, greek_strong, greek_lemma, n FROM lxx_rendering WHERE strong_base=? "
+                         "ORDER BY n DESC, greek_key", (base,)).fetchall()
+        total = sum(r[3] for r in rows)
+        out["lxx"] = {"total": total, "items": [{"key": r[0], "strong": r[1] or "", "lemma": r[2] or r[0], "n": r[3]}
+                                                for r in rows[:10]]}
+        if pu:
+            out["lxx"]["here"] = [{"hebrew": r[0], "greek": r[1], "strong": r[2] or ""} for r in c.execute(
+                "SELECT hebrew, greek, greek_strong FROM lxx_token WHERE passage_unit_id=? AND strong_base=? ORDER BY ord",
+                (pu, base))]
+    if _has_table(c, "bdb_entry"):
+        out["bdb"] = [{"aug": r[0], "headword": r[1], "html": r[2]} for r in c.execute(
+            "SELECT strong_aug, headword, html FROM bdb_entry WHERE strong_base=? ORDER BY strong_aug", (base,))]
+    if _has_table(c, "hebrew_lexica"):
+        lex: dict = {}
+        for r in c.execute("SELECT source, headword, html FROM hebrew_lexica WHERE strong_base=? ORDER BY source, ord", (base,)):
+            lex.setdefault(r[0], []).append({"headword": r[1], "html": r[2]})
+        out["lexica"] = lex
+    # Jewish commentators on this word, in this verse: paragraphs of Jewish-family claims at
+    # the verse whose Hebrew lemma-heading contains this word's consonants.
+    if pu and (surface or headword):
+        keys = {k for k in (_cons(surface), _cons(headword)) if len(k) >= 2}
+        notes = []
+        for r in c.execute(
+                "SELECT sw.author, sw.family, sw.date_label, ic.claim_text FROM interpretive_claim ic "
+                "JOIN source_work sw ON sw.id=ic.source_work_id WHERE ic.passage_unit_id=? AND ic.claim_type='commentary' "
+                "AND (sw.family LIKE '%Jewish%' OR sw.family LIKE 'Targum%') ORDER BY sw.sort_year, sw.author", (pu,)):
+            for para in (r[3] or "").split("\n\n"):
+                heb = {_cons(w) for w in re.findall(r"[\u05d0-\u05ea\u0591-\u05c7]+", para[:160])}
+                if any(k in heb or any(h.endswith(k) and len(h) - len(k) <= 2 for h in heb) for k in keys):
+                    if notes and notes[-1]["author"] == r[0]:
+                        notes[-1]["text"] += "\n\n" + para
+                    else:
+                        notes.append({"author": r[0], "family": r[1], "date": r[2], "text": para})
+        out["jewish_here"] = notes[:12]
+    return out
+
+
+def q_word(strong: str, pu: str = "", surface: str = "") -> dict:
     c = con()
     occ = c.execute(
         "SELECT pu.id pu, pu.canonical_start ref, t.surface_text surf, t.direction dir FROM token_lemma tl "
@@ -353,22 +424,60 @@ def q_word(strong: str) -> dict:
         "JOIN passage_unit pu ON pu.id=t.passage_unit_id WHERE li.identifier_value=?",
         (strong, strong)).fetchall()
     items = [{"pu": r["pu"], "ref": r["ref"], "surf": r["surf"]} for r in occ]
-    return {"strong": strong, "def": _lex_for(c, strong), "total": len(items), "items": items[:OCC_CAP]}
+    d = _lex_for(c, strong)
+    res = {"strong": strong, "def": d, "total": len(items), "items": items[:OCC_CAP]}
+    if strong.startswith("H"):
+        res["depth"] = q_hebrew_depth(c, strong, pu, surface, (d or {}).get("headword", ""))
+    return res
+
+
+_family_order: dict = {}
+
+
+def _families(c) -> dict:
+    """family -> display rank, ordered by the earliest dated work in each family, so
+    sections run roughly in order of historical emergence and no tradition is placed
+    first by fiat."""
+    if not _family_order:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(source_work)")}
+        if "family" in cols:
+            rows = c.execute("SELECT family, MIN(CASE WHEN sort_year < 3000 THEN sort_year END) y FROM source_work "
+                             "WHERE family IS NOT NULL GROUP BY family ORDER BY y IS NULL, y, family").fetchall()
+            _family_order.update({r[0]: i for i, r in enumerate(rows)})
+    return _family_order
 
 
 def q_commentary(pu: str) -> dict:
-    """Rung-7 interpretation layer: public-domain commentary for one verse, each
-    entry attributed to its author, tradition, and era (see docs/fidelity-principle.md)."""
+    """Rung-7 interpretation layer: commentary for one verse, each entry attributed to its
+    author, tradition and era, grouped by family (see docs/fidelity-principle.md)."""
     c = con()
+    fam = _families(c)
+    has_fam = bool(fam)
+    sel = ("sw.title, sw.author, sw.tradition, sw.date_label, sw.genre, sw.rights_note, ic.claim_text, ic.notes, "
+           + ("sw.family, sw.sort_year" if has_fam else "NULL family, NULL sort_year"))
     rows = c.execute(
-        "SELECT sw.title, sw.author, sw.tradition, sw.date_label, ic.claim_text "
-        "FROM interpretive_claim ic JOIN source_work sw ON sw.id=ic.source_work_id "
-        "WHERE ic.passage_unit_id=? AND ic.claim_type='commentary' ORDER BY sw.id",
-        (pu,)).fetchall()
+        f"SELECT {sel} FROM interpretive_claim ic JOIN source_work sw ON sw.id=ic.source_work_id "
+        "WHERE ic.passage_unit_id=? AND ic.claim_type='commentary'", (pu,)).fetchall()
     ref = c.execute("SELECT canonical_start ref FROM passage_unit WHERE id=?", (pu,)).fetchone()
-    return {"pu": pu, "ref": ref["ref"] if ref else pu,
-            "entries": [{"title": r["title"], "author": r["author"], "tradition": r["tradition"],
-                         "date": r["date_label"], "text": r["claim_text"]} for r in rows]}
+    groups: dict = {}
+    for r in rows:
+        to = ""
+        if r["notes"]:
+            try:
+                to = (json.loads(r["notes"]) or {}).get("to") or ""
+            except ValueError:
+                to = ""
+        m = re.match(r"pu:.+\.(\d+)\.(\d+|title)$", to)
+        groups.setdefault(r["family"] or "Commentary", []).append({
+            "title": r["title"], "author": r["author"], "tradition": r["tradition"], "date": r["date_label"],
+            "genre": r["genre"], "rights": r["rights_note"] or "", "text": r["claim_text"],
+            "to": f"{m.group(1)}:{m.group(2)}" if m else "", "year": r["sort_year"] or 9999})
+    out = []
+    for name in sorted(groups, key=lambda f: (fam.get(f, 999), f)):
+        es = sorted(groups[name], key=lambda e: (e["year"], e["author"] or ""))
+        out.append({"family": name, "entries": es})
+    return {"pu": pu, "ref": ref["ref"] if ref else pu, "total": len(rows), "families": out,
+            "entries": [e for g in out for e in g["entries"]]}
 
 
 def q_verse(pu: str) -> dict:
@@ -512,7 +621,7 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path == "/api/chapter":
                 self._json(q_chapter(qs["book"][0], int(qs["ch"][0])))
             elif u.path == "/api/word":
-                self._json(q_word(qs["strong"][0]))
+                self._json(q_word(qs["strong"][0], qs.get("pu", [""])[0], qs.get("surf", [""])[0]))
             elif u.path == "/api/verse":
                 self._json(q_verse(qs["pu"][0]))
             elif u.path == "/api/commentary":
@@ -625,6 +734,53 @@ body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,Bl
 #panel .cmeta .ctrad{font-size:11px;color:var(--accent)}
 #panel .cmeta .cdate{font-size:11px;color:var(--faint);font-variant-numeric:tabular-nums}
 #panel .ctext{font-size:13px;line-height:1.6;color:#333}
+#panel .ctext.clamp{display:-webkit-box;-webkit-line-clamp:6;-webkit-box-orient:vertical;overflow:hidden}
+#panel .cmore{font:inherit;font-size:12px;color:var(--accent);background:none;border:none;padding:4px 0;cursor:pointer}
+#panel .ctrad{font-size:11px;color:var(--accent);margin:-2px 0 6px}
+#panel .crng{font-size:11px;color:var(--faint)}
+#panel .cfctl{display:flex;gap:6px;margin:10px 0 4px}
+#panel .cfctl button{font:inherit;font-size:12px;padding:4px 10px;border:1px solid var(--line);border-radius:7px;background:#fff;color:var(--muted);cursor:pointer}
+#panel details.cfam{border-top:1px solid var(--line)}
+#panel details.cfam>summary{list-style:none;display:flex;justify-content:space-between;align-items:center;gap:10px;padding:11px 2px;cursor:pointer;font-size:14px;font-weight:600}
+#panel details.cfam>summary::-webkit-details-marker{display:none}
+#panel details.cfam>summary::before{content:"›";display:inline-block;width:14px;color:var(--faint);transition:transform .12s}
+#panel details.cfam[open]>summary::before{transform:rotate(90deg)}
+#panel details.cfam>summary .fname{flex:1}
+#panel details.cfam>summary .fcount{font-size:12px;font-weight:400;color:var(--faint);font-variant-numeric:tabular-nums}
+#panel details.cfam .ccard{margin:0 0 0 14px}
+/* word panel: deeper Hebrew evidence */
+#panel details.wsec{border-top:1px solid var(--line);margin-top:6px}
+#panel details.wsec>summary{list-style:none;cursor:pointer;padding:10px 0;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);display:flex;gap:8px;align-items:baseline}
+#panel details.wsec>summary::-webkit-details-marker{display:none}
+#panel details.wsec>summary::before{content:"›";display:inline-block;width:10px;transition:transform .12s}
+#panel details.wsec[open]>summary::before{transform:rotate(90deg)}
+#panel .wnote{text-transform:none;letter-spacing:0;font-size:11px;color:var(--faint);margin-left:auto}
+#panel .wbody{font-size:13px;line-height:1.55;color:#333;padding:0 0 10px}
+#panel .wsrc{font-size:11.5px;color:var(--faint);margin:0 0 8px;line-height:1.45}
+#panel .sm{padding:7px 0;border-top:1px solid #f2f2f2}
+#panel .sm.smhere{background:var(--sel);margin:0 -8px;padding:7px 8px;border-radius:6px}
+#panel .sg{font-weight:600;color:var(--ink)}
+#panel .sn{font-size:11px;color:var(--faint);font-variant-numeric:tabular-nums}
+#panel .sd{color:#444}
+#panel .sx{font-size:12px;color:var(--muted);margin-top:2px}
+#panel .tag-here{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--accent);font-weight:600}
+#panel .he{font-family:"SBL Hebrew","Taamey Frank CLM","Times New Roman",serif;font-size:15px}
+#panel .lx{display:grid;grid-template-columns:minmax(80px,auto) 1fr auto;gap:8px;align-items:center;padding:3px 0}
+#panel .lxw{font-size:15px}
+#panel .lxbar{height:6px;background:#f0f0f0;border-radius:3px;overflow:hidden}
+#panel .lxbar i{display:block;height:100%;background:var(--accent);opacity:.55}
+#panel .lxn{font-size:11px;color:var(--faint);font-variant-numeric:tabular-nums}
+#panel .lexe{padding:8px 0;border-top:1px solid #f2f2f2}
+#panel .lexh{font-size:18px;text-align:right}
+#panel .lexe .bs,#panel .lexe .ls{margin:3px 0 3px 10px}
+#panel .lexe .r{color:var(--accent)}
+#panel .here{background:#fbfaf6;border:1px solid #ece6d6;border-radius:10px;padding:10px 12px;margin:14px 0 4px}
+#panel .herehd{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#8a7a52;margin-bottom:6px}
+#panel .hrow{display:grid;grid-template-columns:78px 1fr;gap:8px;font-size:13px;padding:3px 0}
+#panel .hk{color:var(--faint);font-size:12px}
+#panel .src{font-size:10.5px;color:var(--faint)}
+#panel .hnote{border-top:1px solid #ece6d6;margin-top:6px;padding-top:6px}
+#panel .hna{font-weight:600;font-size:12.5px}
 footer{color:var(--faint);font-size:12px;border-top:1px solid var(--line);padding-top:18px;margin-top:40px}
 /* feedback */
 .fbbtn{font:inherit;font-size:12px;padding:5px 9px;border:1px solid var(--line);border-radius:7px;background:#fff;color:var(--muted);cursor:pointer}
@@ -775,7 +931,7 @@ function tokenCell(t,lang){
   let orig;
   if(lang==='hbo' && t.morphemes){ orig='<div class="orig hbo">'+t.morphemes.map(m=>'<span class="m m-'+esc(m.role)+'">'+esc(m.surface)+'</span>').join('')+'</div>'; }
   else orig='<div class="orig grc">'+esc(t.surface)+'</div>';
-  return '<div class="w" data-strong="'+esc(t.strong)+'">'+orig+
+  return '<div class="w" data-strong="'+esc(t.strong)+'" data-surf="'+esc(t.surface)+'">'+orig+
     (t.translit?'<div class="tr">'+esc(t.translit)+'</div>':'')+
     (t.gloss?'<div class="gl">'+esc(t.gloss)+'</div>':'')+
     (t.strong?'<div class="meta">'+esc(t.strong)+'</div>':'')+'</div>';
@@ -820,15 +976,20 @@ function render(data){
 
 document.addEventListener('click',async e=>{
   const w=e.target.closest('.w[data-strong]');
-  if(w && w.getAttribute('data-strong')){ showWord(w.getAttribute('data-strong')); return; }
+  if(w && w.getAttribute('data-strong')){ const vv=w.closest('.verse[data-pu]');
+    showWord(w.getAttribute('data-strong'), vv?vv.getAttribute('data-pu'):'', w.getAttribute('data-surf')||''); return; }
+  const mb=e.target.closest('.cmore');
+  if(mb){ const t=mb.previousElementSibling; const open=t.classList.toggle('clamp'); mb.textContent=open?'Show more':'Show less'; return; }
+  const xa=e.target.closest('[data-cfall]');
+  if(xa){ const op=xa.getAttribute('data-cfall')==='1'; body.querySelectorAll('details.cfam').forEach(d=>d.open=op); return; }
   const o=e.target.closest('.o[data-pu]');
   if(o){ jumpTo(o.getAttribute('data-pu')); return; }
   const cn=e.target.closest('.cnote[data-pu]');
   if(cn){ showCommentary(cn.getAttribute('data-pu')); }
 });
-async function showWord(strong){
+async function showWord(strong, pu, surf){
   body.innerHTML='<div class="loading">Loading…</div>'; panel.classList.add('open'); scrim.classList.add('open');
-  const w=await (await fetch('/api/word?strong='+encodeURIComponent(strong))).json();
+  const w=await (await fetch('/api/word?strong='+encodeURIComponent(strong)+'&pu='+encodeURIComponent(pu||'')+'&surf='+encodeURIComponent(surf||''))).json();
   lastWord={strong:strong, headword:(w.def&&w.def.headword)?w.def.headword:strong};
   const heb=strong[0]==='H';
   let h='<div class="pw '+(heb?'hbo':'grc')+'">'+esc(w.def&&w.def.headword?w.def.headword:strong)+'</div>';
@@ -837,26 +998,88 @@ async function showWord(strong){
   h+='<div class="pmeta">'+dm.join(' · ')+'</div>';
   if(w.def){
     if(w.def.gloss)h+='<div class="pgloss">'+esc(w.def.gloss)+'</div>';
-    if(w.def.entry)h+='<div class="pentry">'+w.def.entry+'</div>';
-    if(w.def.gated)h+='<div class="rights">Hebrew brief definition (TBESH / Abridged BDB) — internal use; licensing to be cleared before any public display.</div>';
-  } else h+='<div class="pentry">No lexicon entry for this Strong’s number.</div>';
+  }
+  const D=w.depth||null;
+  if(D) h+=depthHere(D, pu);
+  if(w.def&&w.def.entry){
+    h+=sec("Strong’s · abridged BDB (STEPBible)", '<div class="pentry">'+w.def.entry+'</div>'+
+       (w.def.gated?'<div class="rights">TBESH (abridged BDB) is internal use; licensing to be cleared before any public display.</div>':''), !D);
+  } else if(!w.def) h+='<div class="pentry">No lexicon entry for this Strong’s number.</div>';
+  if(D) h+=depthSections(D);
   h+='<h4>Appears '+w.total+' time'+(w.total===1?'':'s')+(w.total>w.items.length?' (showing '+w.items.length+')':'')+'</h4><div class="occ">';
   for(const o of w.items){ h+='<div class="o" data-pu="'+esc(o.pu)+'"><span class="oref">'+esc(o.ref)+' ›</span><span class="osurf">'+esc(o.surf)+'</span></div>'; }
   h+='</div>';
   body.innerHTML=h; panel.scrollTop=0;
 }
+function sec(title, inner, open, note){
+  return '<details class="wsec"'+(open?' open':'')+'><summary>'+esc(title)+(note?'<span class="wnote">'+esc(note)+'</span>':'')+'</summary><div class="wbody">'+inner+'</div></details>';
+}
+function glossLine(m){ return '<span class="sg">'+esc((m.glosses||[]).join(', '))+'</span>'; }
+function depthHere(D, pu){
+  if(!pu) return '';
+  const here=(D.sdbh||[]).filter(m=>m.here); const lx=(D.lxx&&D.lxx.here)||[]; const jw=D.jewish_here||[];
+  if(!here.length && !lx.length && !jw.length) return '';
+  let x='<div class="here"><div class="herehd">In this verse</div>';
+  for(const m of here) x+='<div class="hrow"><span class="hk">Meaning</span><span>'+glossLine(m)+(m.def?' <span class="sd">— '+esc(m.def)+'</span>':'')+' <span class="src">UBS SDBH</span></span></div>';
+  if(lx.length) x+='<div class="hrow"><span class="hk">Septuagint</span><span><span class="grc">'+lx.map(t=>esc(t.greek)).join(' · ')+'</span> <span class="src">LXX via MACULA</span></span></div>';
+  for(const n of jw) x+='<div class="hnote"><div class="hna">'+esc(n.author)+(n.date?' <span class="cdate">'+esc(n.date)+'</span>':'')+'</div><div class="ctext clamp">'+fmt(n.text)+'</div>'+(n.text.length>380?'<button class="cmore">Show more</button>':'')+'</div>';
+  return x+'</div>';
+}
+function depthSections(D){
+  let h='';
+  const ms=D.sdbh||[];
+  if(ms.length){
+    let x='<p class="wsrc">Distinct meanings with every verse each occurs in. United Bible Societies, <em>Semantic Dictionary of Biblical Hebrew</em> (CC BY-SA 4.0).</p>';
+    for(const m of ms){
+      x+='<div class="sm'+(m.here?' smhere':'')+'"><div>'+glossLine(m)+' <span class="sn">'+m.n+'×</span>'+(m.here?' <span class="tag-here">here</span>':'')+'</div>'+
+        (m.def?'<div class="sd">'+esc(m.def)+'</div>':'')+
+        ((m.domains||[]).length?'<div class="sx">Domain: '+esc(m.domains.join(', '))+'</div>':'')+
+        ((m.syn||[]).length?'<div class="sx">Related: <span class="he" dir="rtl">'+esc(m.syn.join('، '))+'</span></div>':'')+
+        ((m.ant||[]).length?'<div class="sx">Opposite: <span class="he" dir="rtl">'+esc(m.ant.join('، '))+'</span></div>':'')+'</div>';
+    }
+    const n0=ms.find(m=>m.notes); if(n0) x+='<div class="sx">Notes: '+esc(n0.notes)+'</div>';
+    const lk=(ms.find(m=>(m.links||[]).length)||{}).links||[]; if(lk.length) x+='<div class="sx">Further: '+lk.map(u=>'<a href="'+esc(u)+'" target=_blank rel=noopener>'+esc(u.replace(/^https?:\/\//,'').replace(/\/$/,''))+'</a>').join(' · ')+'</div>';
+    h+=sec('Meanings', x, true, ms.length+' in SDBH');
+  }
+  const L=D.lxx;
+  if(L&&L.total){
+    let x='<p class="wsrc">How the Jewish translators of the Septuagint (3rd–2nd c. BCE) rendered this word in Greek, across every aligned occurrence. MACULA Hebrew alignment (Clear Bible, CC BY 4.0).</p>';
+    for(const it of L.items){ const pc=Math.round(100*it.n/L.total);
+      x+='<div class="lx"><span class="lxw '+(it.key.startsWith('(')?'':'grc')+'">'+esc(it.lemma)+'</span><span class="lxbar"><i style="width:'+pc+'%"></i></span><span class="lxn">'+it.n+' · '+pc+'%</span></div>'; }
+    h+=sec('Septuagint renderings', x, true, L.total+' aligned');
+  }
+  const lex=D.lexica||{};
+  if((lex['BDB (Sefaria, full)']||[]).length) h+=sec('Brown-Driver-Briggs', '<p class="wsrc">Full 1906 entry with references (public domain; digitized by Sefaria).</p>'+lex['BDB (Sefaria, full)'].map(e=>'<div class="lexe"><div class="lexh he" dir="rtl">'+esc(e.headword)+'</div>'+e.html+'</div>').join(''), false);
+  else if((D.bdb||[]).length) h+=sec('Brown-Driver-Briggs', '<p class="wsrc">1906 entry (public domain; Open Scriptures HebrewLexicon).</p>'+D.bdb.map(e=>'<div class="lexe">'+e.html+'</div>').join(''), false);
+  if((lex['Jastrow']||[]).length) h+=sec('Jastrow · rabbinic usage', '<p class="wsrc">How the word lived on in Talmud, Midrash and the Targums. Marcus Jastrow, <em>Dictionary of the Targumim, the Talmud Babli and Yerushalmi, and the Midrashic Literature</em> (1903, public domain; via Sefaria).</p>'+lex['Jastrow'].map(e=>'<div class="lexe"><div class="lexh he" dir="rtl">'+esc(e.headword)+'</div>'+e.html+'</div>').join(''), false, lex['Jastrow'].length+' entr'+(lex['Jastrow'].length===1?'y':'ies'));
+  if((lex['Klein']||[]).length) h+=sec('Klein · etymology', '<p class="wsrc">Roots, cognates and later Hebrew senses. Ernest Klein, <em>A Comprehensive Etymological Dictionary of the Hebrew Language</em> (via Sefaria).</p>'+lex['Klein'].map(e=>'<div class="lexe"><div class="lexh he" dir="rtl">'+esc(e.headword)+'</div>'+e.html+'</div>').join(''), false, lex['Klein'].length+' entr'+(lex['Klein'].length===1?'y':'ies'));
+  return h;
+}
+function fmt(t){ return esc(t||'').replace(/\n{2,}/g,'<br><br>').replace(/\n/g,'<br>'); }
+function loadFamOpen(){ try{ return new Set(JSON.parse(localStorage.getItem('st.cfam')||'[]')); }catch(e){ return new Set(); } }
 async function showCommentary(pu){
   body.innerHTML='<div class="loading">Loading…</div>'; panel.classList.add('open'); scrim.classList.add('open'); lastWord=null;
   const d=await (await fetch('/api/commentary?pu='+encodeURIComponent(pu))).json();
-  let h='<div class="pw" style="font-size:20px">'+esc(d.ref||'')+'</div><div class="pmeta">Commentary · public domain</div>';
-  h+='<p class="chint">What these commentators said about this verse. Each entry is one named voice in its own tradition and time.</p>';
-  for(const e of (d.entries||[])){
-    h+='<div class="ccard"><div class="cmeta"><span class="cauth">'+esc(e.author||e.title||'')+'</span>'+
-       (e.tradition?'<span class="ctrad">'+esc(e.tradition)+'</span>':'')+(e.date?'<span class="cdate">'+esc(e.date)+'</span>':'')+'</div>'+
-       '<div class="ctext">'+esc(e.text||'').replace(/\n{2,}/g,'<br><br>').replace(/\n/g,' ')+'</div></div>';
+  const fams=d.families||[]; const openSet=loadFamOpen();
+  let h='<div class="pw" style="font-size:20px">'+esc(d.ref||'')+'</div><div class="pmeta">'+(d.total||0)+' voices · '+fams.length+' traditions</div>';
+  h+='<p class="chint">What people across traditions and centuries have said about this verse. Each entry is one named voice, in its own tradition and time. Sections run roughly in order of when each tradition emerged.</p>';
+  if(fams.length>1) h+='<div class="cfctl"><button data-cfall=1>Open all</button><button data-cfall=0>Close all</button></div>';
+  for(const g of fams){
+    h+='<details class="cfam" data-fam="'+esc(g.family)+'"'+(openSet.has(g.family)||fams.length===1?' open':'')+'><summary><span class="fname">'+esc(g.family)+'</span><span class="fcount">'+g.entries.length+'</span></summary>';
+    for(const e of g.entries){
+      const long=(e.text||'').length>420;
+      h+='<div class="ccard"><div class="cmeta"><span class="cauth">'+esc(e.author||e.title||'')+'</span>'+
+         (e.date?'<span class="cdate">'+esc(e.date)+'</span>':'')+(e.to?'<span class="crng">to '+esc(e.to)+'</span>':'')+'</div>'+
+         (e.tradition?'<div class="ctrad">'+esc(e.tradition)+(e.title&&e.title!==e.author&&e.genre!=='quotation'?' · <em>'+esc(e.title)+'</em>':'')+'</div>':'')+
+         '<div class="ctext'+(long?' clamp':'')+'">'+fmt(e.text)+'</div>'+(long?'<button class="cmore">Show more</button>':'')+'</div>';
+    }
+    h+='</details>';
   }
-  if(!d.entries||!d.entries.length) h+='<div class="pentry">No commentary for this verse yet.</div>';
+  if(!fams.length) h+='<div class="pentry">No commentary for this verse yet.</div>';
   body.innerHTML=h; panel.scrollTop=0;
+  body.querySelectorAll('details.cfam').forEach(dt=>dt.addEventListener('toggle',()=>{
+    const s=loadFamOpen(); dt.open?s.add(dt.dataset.fam):s.delete(dt.dataset.fam);
+    try{ localStorage.setItem('st.cfam', JSON.stringify([...s])); }catch(e){} }));
 }
 function jumpTo(pu){ // pu:OSIS.ch.vs(.title)
   const m=pu.match(/^pu:(.+)\.(\d+)\.(\d+|title)$/); if(!m) return;
