@@ -67,6 +67,12 @@ def _load_auth_users() -> dict:
 
 
 AUTH_USERS = _load_auth_users()
+# Hosts served without the login (e.g. "source-text.com,www.source-text.com"). Requests to any
+# other host (bible.noahglynn.com, the onrender.com name) keep the Basic Auth gate. Every
+# response carries noindex either way (X-Robots-Tag + meta + robots.txt that allows crawling
+# so the noindex is seen).
+PUBLIC_HOSTS = {h.strip().lower() for h in (os.environ.get("PUBLIC_HOSTS") or "").split(",") if h.strip()}
+FEEDBACK_MAX_BYTES = 5 * 1024 * 1024   # stop accepting public feedback past this file size
 
 # Feedback capture (beta): append-only JSONL, kept separate from the read-only
 # corpus DB. On Render set FEEDBACK_PATH=/var/data/feedback.jsonl (persistent disk);
@@ -604,6 +610,8 @@ def record_feedback(user, data: dict) -> None:
     }
     FEEDBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _fb_lock:
+        if FEEDBACK_PATH.exists() and FEEDBACK_PATH.stat().st_size > FEEDBACK_MAX_BYTES:
+            raise ValueError("feedback store full")
         with open(FEEDBACK_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
@@ -629,6 +637,14 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quiet
         pass
 
+    def end_headers(self):
+        self.send_header("X-Robots-Tag", "noindex, nofollow")
+        super().end_headers()
+
+    def _public(self) -> bool:
+        host = (self.headers.get("Host") or "").split(":")[0].strip().lower()
+        return host in PUBLIC_HOSTS
+
     def _send(self, code, body: bytes, ctype):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -650,7 +666,7 @@ class Handler(BaseHTTPRequestHandler):
             return ""  # gate off (local use)
         hdr = self.headers.get("Authorization", "")
         if not hdr.startswith("Basic "):
-            return None
+            return "" if self._public() else None
         try:
             user, _, pw = base64.b64decode(hdr[6:]).decode("utf-8").partition(":")
         except Exception:
@@ -658,13 +674,18 @@ class Handler(BaseHTTPRequestHandler):
         expected = AUTH_USERS.get(user)
         if expected is None:
             secrets.compare_digest(pw, pw)  # even out timing for unknown users
-            return None
-        return user if secrets.compare_digest(pw, expected) else None
+            return "" if self._public() else None
+        if secrets.compare_digest(pw, expected):
+            return user
+        return "" if self._public() else None
 
     def do_GET(self):
         u = urlparse(self.path)
         if u.path == "/healthz":   # unauthenticated liveness check (Render)
             self._send(200, b"ok", "text/plain")
+            return
+        if u.path == "/robots.txt":   # crawling allowed so crawlers see the noindex header
+            self._send(200, b"User-agent: *\nAllow: /\n", "text/plain")
             return
         if self._auth_user() is None:
             self.send_response(401)
@@ -719,7 +740,7 @@ class Handler(BaseHTTPRequestHandler):
             if not (data.get("comment") or "").strip():
                 self._send(400, json.dumps({"error": "empty"}).encode(), "application/json")
                 return
-            record_feedback(user, data)
+            record_feedback(user or ("public" if self._public() else ""), data)
             self._json({"ok": True})
         except Exception as exc:  # noqa: BLE001
             self._send(500, json.dumps({"error": str(exc)}).encode(), "application/json")
@@ -1220,6 +1241,7 @@ init();
 PAGE = (
     "<!doctype html><html lang=en><head><meta charset=utf-8>"
     "<meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<meta name=robots content='noindex,nofollow'>"
     "<title>Source Text</title><style>" + CSS + "</style>"
     "<script>try{if(localStorage.getItem('st.hintseen'))document.documentElement.classList.add('hint-seen');else localStorage.setItem('st.hintseen','1');}catch(e){}</script>"
     "</head><body>"
