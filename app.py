@@ -447,6 +447,61 @@ def _families(c) -> dict:
     return _family_order
 
 
+_QLABEL = re.compile(r"^((?:Whole Psalm|Title|Verses?\s+\d+(?:\s*[-\u2013,]\s*\d+)*|\((?:first|second|third|fourth|"
+                     r"fifth|middle|last) clause\))\.?)\s*", re.I)
+_QLEMMA = re.compile(r"^([\"\u201c])(.{3,260}?)([\"\u201d])\s*")
+
+
+def quote_items(text: str, parts: list | None) -> list:
+    """Split a quotation collection's verse entry (Treasury of David notes, HCF collected
+    comments) into its quotations: {head, who, src, text}. parts are the stored lengths of
+    each quotation (joined by a blank line); without them, a quotation ends at its
+    attribution line ('\n\u2014 Writer, Work, year'). head is the clause or section a
+    quotation comments on ('Whole Psalm', 'Verse 4', the quoted words of the verse), so
+    the reader can show it once above a run of quotations on the same words."""
+    chunks: list[str] = []
+    if parts and sum(parts) + 2 * (len(parts) - 1) == len(text):
+        i = 0
+        for n in parts:
+            chunks.append(text[i:i + n])
+            i += n + 2
+    else:
+        cur: list[str] = []
+        for para in text.split("\n\n"):
+            cur.append(para)
+            if "\n\u2014 " in para or para.startswith("\u2014 "):
+                chunks.append("\n\n".join(cur))
+                cur = []
+        if cur:
+            chunks.append("\n\n".join(cur))
+    out = []
+    for ch in chunks:
+        body, attr = ch.strip(), ""
+        k = body.rfind("\n\u2014 ")
+        if k >= 0:
+            body, attr = body[:k].strip(), body[k + 3:].strip()
+        heads = []
+        m = _QLABEL.match(body)
+        if m:
+            lab = m.group(1).rstrip(".")
+            heads.append({"whole psalm": "On the whole psalm", "title": "On the title"}.get(lab.lower(), lab))
+            body = body[m.end():]
+        m = _QLEMMA.match(body)
+        if m and len(body) > m.end() + 40:
+            heads.append("\u201c" + m.group(2).strip() + "\u201d")
+            body = body[m.end():].lstrip(":;,. ")
+        attr = attr.rstrip(".").strip()
+        if attr.isupper():          # HCF source titles: 'SELECTIONS FROM THE PSALMS 23:4'
+            attr = re.sub(r"\b(Of|The|On|In|And|To|From|A|An|For|Against)\b",
+                          lambda x: x.group(1).lower(), attr.title())
+            attr = attr[:1].upper() + attr[1:]
+        who, src = attr, ""
+        if "," in attr:
+            who, src = (x.strip() for x in attr.split(",", 1))
+        out.append({"head": " \u00b7 ".join(heads), "who": who, "src": src, "text": body.strip()})
+    return out
+
+
 def q_commentary(pu: str) -> dict:
     """Rung-7 interpretation layer: commentary for one verse, each entry attributed to its
     author, tradition and era, grouped by family (see docs/fidelity-principle.md)."""
@@ -461,17 +516,24 @@ def q_commentary(pu: str) -> dict:
     ref = c.execute("SELECT canonical_start ref FROM passage_unit WHERE id=?", (pu,)).fetchone()
     groups: dict = {}
     for r in rows:
-        to = ""
+        meta = {}
         if r["notes"]:
             try:
-                to = (json.loads(r["notes"]) or {}).get("to") or ""
+                meta = json.loads(r["notes"]) or {}
             except ValueError:
-                to = ""
+                meta = {}
+        to = meta.get("to") or ""
         m = re.match(r"pu:.+\.(\d+)\.(\d+|title)$", to)
-        groups.setdefault(r["family"] or "Commentary", []).append({
-            "title": r["title"], "author": r["author"], "tradition": r["tradition"], "date": r["date_label"],
-            "genre": r["genre"], "rights": r["rights_note"] or "", "text": r["claim_text"],
-            "to": f"{m.group(1)}:{m.group(2)}" if m else "", "year": r["sort_year"] or 9999})
+        e = {"title": r["title"], "author": r["author"], "tradition": r["tradition"], "date": r["date_label"],
+             "genre": r["genre"], "rights": r["rights_note"] or "", "text": r["claim_text"],
+             "to": f"{m.group(1)}:{m.group(2)}" if m else "", "year": r["sort_year"] or 9999}
+        if r["genre"] == "quotation":
+            items = quote_items(r["claim_text"], meta.get("parts"))
+            # a list when there is more than one quotation, or when the card names a gatherer
+            # rather than the writer (Treasury of David notes: the writer goes first)
+            if len(items) > 1 or (items and (r["author"] or "").startswith("Writers gathered")):
+                e["items"] = items
+        groups.setdefault(r["family"] or "Commentary", []).append(e)
     out = []
     for name in sorted(groups, key=lambda f: (fam.get(f, 999), f)):
         es = sorted(groups[name], key=lambda e: (e["year"], e["author"] or ""))
@@ -748,6 +810,18 @@ body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,Bl
 #panel details.cfam>summary .fname{flex:1}
 #panel details.cfam>summary .fcount{font-size:12px;font-weight:400;color:var(--faint);font-variant-numeric:tabular-nums}
 #panel details.cfam .ccard{margin:0 0 0 14px}
+/* quotation collections (Treasury of David notes, HCF): writer first, first lines, expand to read */
+#panel .qcount{font-size:11px;color:var(--faint);margin:2px 0 4px}
+#panel .qhead{font-size:12px;font-style:italic;color:var(--muted);line-height:1.45;margin:12px 0 2px}
+#panel details.qi{border-top:1px solid #f0f0f0}
+#panel details.qi>summary{list-style:none;cursor:pointer;padding:8px 0 7px;display:block}
+#panel details.qi>summary::-webkit-details-marker{display:none}
+#panel .qwho{font-weight:600;font-size:13px;color:var(--ink)}
+#panel .qsrc{font-size:11.5px;color:var(--faint);margin-left:6px}
+#panel .qprev{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:13px;line-height:1.5;color:#555;margin-top:2px}
+#panel details.qi>summary:hover .qwho{color:var(--accent)}
+#panel details.qi[open] .qprev{display:none}
+#panel .qfull{font-size:13px;line-height:1.6;color:#333;padding:2px 0 10px}
 /* word panel: deeper Hebrew evidence */
 #panel details.wsec{border-top:1px solid var(--line);margin-top:6px}
 #panel details.wsec>summary{list-style:none;cursor:pointer;padding:10px 0;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);display:flex;gap:8px;align-items:baseline}
@@ -874,7 +948,10 @@ async function init(){
     if(b.testament!==lastT){ lastT=b.testament; og=document.createElement('optgroup'); og.label=({OT:'Old Testament',NT:'New Testament',DC:'Deuterocanon',AP:'Appendix'})[b.testament]||b.testament; bsel.appendChild(og); }
     const o=document.createElement('option'); o.value=b.osis; o.textContent=b.name; (og||bsel).appendChild(o);
   }
-  bsel.value='John'; onBook();
+  // #pu:Ps.23.4 opens that chapter at the verse; #c=pu:Ps.23.4 also opens its commentary
+  const hm=decodeURIComponent(location.hash.slice(1)).match(/^(c=)?(pu:[A-Za-z0-9]+\.\d+\.(?:\d+|title))$/);
+  if(hm&&BOOKS.some(b=>hm[2].startsWith('pu:'+b.osis+'.'))){ jumpTo(hm[2]).then(()=>{ if(hm[1]) showCommentary(hm[2]); }); }
+  else { bsel.value='John'; onBook(); }
   bsel.addEventListener('change',onBook);
   $('#chap').addEventListener('change',()=>{cur.ch=+$('#chap').value; load();});
   $('#prev').addEventListener('click',()=>{if(cur.ch>1){cur.ch--;syncChap();load();}});
@@ -1056,6 +1133,16 @@ function depthSections(D){
   return h;
 }
 function fmt(t){ return esc(t||'').replace(/\n{2,}/g,'<br><br>').replace(/\n/g,'<br>'); }
+function quoteList(e){ // a quotation collection: writer first, first lines, tap to read the rest
+  const its=e.items; let h='<div class="qcount">'+its.length+' quotation'+(its.length===1?'':'s')+'</div><div class="qlist">', last=null;
+  for(const it of its){
+    if(it.head&&it.head!==last) h+='<div class="qhead">'+esc(it.head)+'</div>';
+    last=it.head||last;
+    h+='<details class="qi"><summary><span class="qwho">'+esc(it.who||'Unsigned')+'</span>'+(it.src?'<span class="qsrc">'+esc(it.src)+'</span>':'')+
+       '<span class="qprev">'+esc(it.text.replace(/\s+/g,' '))+'</span></summary><div class="qfull">'+fmt(it.text)+'</div></details>';
+  }
+  return h+'</div>';
+}
 function loadFamOpen(){ try{ return new Set(JSON.parse(localStorage.getItem('st.cfam')||'[]')); }catch(e){ return new Set(); } }
 async function showCommentary(pu){
   body.innerHTML='<div class="loading">Loading…</div>'; panel.classList.add('open'); scrim.classList.add('open'); lastWord=null;
@@ -1068,10 +1155,11 @@ async function showCommentary(pu){
     h+='<details class="cfam" data-fam="'+esc(g.family)+'"'+(openSet.has(g.family)||fams.length===1?' open':'')+'><summary><span class="fname">'+esc(g.family)+'</span><span class="fcount">'+g.entries.length+'</span></summary>';
     for(const e of g.entries){
       const long=(e.text||'').length>420;
+      const ql=(e.items||[]).length>1||((e.items||[]).length===1&&e.items[0].who);
       h+='<div class="ccard"><div class="cmeta"><span class="cauth">'+esc(e.author||e.title||'')+'</span>'+
          (e.date?'<span class="cdate">'+esc(e.date)+'</span>':'')+(e.to?'<span class="crng">to '+esc(e.to)+'</span>':'')+'</div>'+
          (e.tradition?'<div class="ctrad">'+esc(e.tradition)+(e.title&&e.title!==e.author&&e.genre!=='quotation'?' · <em>'+esc(e.title)+'</em>':'')+'</div>':'')+
-         '<div class="ctext'+(long?' clamp':'')+'">'+fmt(e.text)+'</div>'+(long?'<button class="cmore">Show more</button>':'')+'</div>';
+         (ql?quoteList(e):'<div class="ctext'+(long?' clamp':'')+'">'+fmt(e.text)+'</div>'+(long?'<button class="cmore">Show more</button>':''))+'</div>';
     }
     h+='</details>';
   }
@@ -1086,10 +1174,10 @@ function jumpTo(pu){ // pu:OSIS.ch.vs(.title)
   const osis=m[1], ch=+m[2];
   targetVerse=pu; close();
   cur.osis=osis; const b=BOOKS.find(x=>x.osis===osis); cur.name=b?b.name:osis; cur.ch=ch;
-  $('#book').value=osis; onBookKeepChap();
+  $('#book').value=osis; return onBookKeepChap();
 }
 function onBookKeepChap(){ const b=BOOKS.find(x=>x.osis===cur.osis); const cs=$('#chap'); cs.innerHTML='';
-  for(let i=1;i<=b.chapters;i++){const o=document.createElement('option');o.value=i;o.textContent=i;cs.appendChild(o);} $('#chap').value=cur.ch; load(); }
+  for(let i=1;i<=b.chapters;i++){const o=document.createElement('option');o.value=i;o.textContent=i;cs.appendChild(o);} $('#chap').value=cur.ch; return load(); }
 function close(){ panel.classList.remove('open'); scrim.classList.remove('open'); lastWord=null; }
 function openFb(){ const w=lastWord;
   $('#fbctx').textContent='On '+(cur.name||'')+' '+(cur.ch||'')+(w?(' · '+(w.headword||w.strong)):'');
