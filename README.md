@@ -1,3 +1,5 @@
+> **Retired 2026-11-09.** This repo only fed the Render service, which was deleted when Source Text moved to AWS Lightsail. Pushing here deploys nothing. Source of truth and deploys: the private `source-text` repo (`deploy/lightsail/deploy.sh`, `DEPLOY.md`).
+
 # source-text-app
 
 Runtime for the Source Text study app (bible.noahglynn.com). Pure-stdlib reader
