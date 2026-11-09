@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import gzip
+import hashlib
 import html
 import json
 import os
@@ -33,6 +35,7 @@ import webbrowser
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from collections import OrderedDict
 from urllib.parse import urlparse, parse_qs
 
 PROJECT = Path(__file__).resolve().parents[2]
@@ -73,6 +76,52 @@ AUTH_USERS = _load_auth_users()
 # so the noindex is seen).
 PUBLIC_HOSTS = {h.strip().lower() for h in (os.environ.get("PUBLIC_HOSTS") or "").split(",") if h.strip()}
 FEEDBACK_MAX_BYTES = 5 * 1024 * 1024   # stop accepting public feedback past this file size
+
+# Response cache. The corpus DB is read-only between rebuilds, so every GET answer is a pure
+# function of (DB build, app version, URL). Answers are kept gzipped in a bounded in-memory LRU
+# (CACHE_MB, default 64; 0 disables), served with an ETag (304 on revalidation) and
+# Cache-Control that lets browsers and a CDN keep them. The ETag changes when the DB file or
+# this app changes, so a rebuild or deploy invalidates every cached answer.
+CACHE_MB = int(os.environ.get("CACHE_MB", "64"))
+_cache: "OrderedDict[str, tuple[str, bytes, str]]" = OrderedDict()
+_cache_bytes = 0
+_cache_lock = threading.Lock()
+
+
+def _build_tag() -> str:
+    try:
+        st = DB.stat()
+        db = f"{st.st_size}-{int(st.st_mtime)}"
+    except OSError:
+        db = "nodb"
+    app = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
+    return hashlib.sha256(f"{db}|{app}".encode()).hexdigest()[:16]
+
+
+BUILD_TAG = _build_tag()
+
+
+def cache_get(key: str):
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit:
+            _cache.move_to_end(key)
+        return hit
+
+
+def cache_put(key: str, etag: str, gz: bytes, ctype: str) -> None:
+    global _cache_bytes
+    if CACHE_MB <= 0 or len(gz) > CACHE_MB * 1024 * 1024 // 4:
+        return
+    with _cache_lock:
+        old = _cache.pop(key, None)
+        if old:
+            _cache_bytes -= len(old[1])
+        _cache[key] = (etag, gz, ctype)
+        _cache_bytes += len(gz)
+        while _cache_bytes > CACHE_MB * 1024 * 1024 and _cache:
+            _k, (_e, g, _c) = _cache.popitem(last=False)
+            _cache_bytes -= len(g)
 
 # Feedback capture (beta): append-only JSONL, kept separate from the read-only
 # corpus DB. On Render set FEEDBACK_PATH=/var/data/feedback.jsonl (persistent disk);
@@ -633,7 +682,17 @@ def read_feedback(limit: int = 200) -> list:
 # HTTP
 # --------------------------------------------------------------------------- #
 
+JSON_CT = "application/json; charset=utf-8"
+
+
+def _jb(obj) -> bytes:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"   # keep-alive: the reader makes several requests per chapter
+    timeout = 30                    # close idle keep-alive connections so they don't pin threads
+
     def log_message(self, *a):  # quiet
         pass
 
@@ -694,34 +753,76 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         qs = parse_qs(u.query)
-        try:
-            if u.path == "/":
-                self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
-            elif u.path == "/api/books":
-                self._json(q_books())
-            elif u.path == "/api/translations":
-                self._json(q_translations())
-            elif u.path == "/api/chapter":
-                self._json(q_chapter(qs["book"][0], int(qs["ch"][0])))
-            elif u.path == "/api/word":
-                self._json(q_word(qs["strong"][0], qs.get("pu", [""])[0], qs.get("surf", [""])[0]))
-            elif u.path == "/api/verse":
-                self._json(q_verse(qs["pu"][0]))
-            elif u.path == "/api/commentary":
-                self._json(q_commentary(qs["pu"][0]))
-            elif u.path == "/api/feedback":  # admin-only read
+        if u.path == "/api/feedback":  # admin-only read, never cached
+            try:
                 if self._auth_user() != FEEDBACK_ADMIN:
                     self._send(403, json.dumps({"error": "forbidden"}).encode(), "application/json")
                 else:
                     self._json({"items": read_feedback()})
-            else:
-                self._send(404, b"not found", "text/plain")
-        except Exception as exc:  # noqa: BLE001
-            self._send(500, json.dumps({"error": str(exc)}).encode(), "application/json")
+            except Exception as exc:  # noqa: BLE001
+                self._send(500, json.dumps({"error": str(exc)}).encode(), "application/json")
+            return
+        routes = {
+            "/": lambda: (PAGE.encode("utf-8"), "text/html; charset=utf-8"),
+            "/api/books": lambda: (_jb(q_books()), JSON_CT),
+            "/api/translations": lambda: (_jb(q_translations()), JSON_CT),
+            "/api/chapter": lambda: (_jb(q_chapter(qs["book"][0], int(qs["ch"][0]))), JSON_CT),
+            "/api/word": lambda: (_jb(q_word(qs["strong"][0], qs.get("pu", [""])[0], qs.get("surf", [""])[0])), JSON_CT),
+            "/api/verse": lambda: (_jb(q_verse(qs["pu"][0])), JSON_CT),
+            "/api/commentary": lambda: (_jb(q_commentary(qs["pu"][0])), JSON_CT),
+        }
+        fn = routes.get(u.path)
+        if not fn:
+            self._send(404, b"not found", "text/plain")
+            return
+        key = u.path + ("?" + u.query if u.query else "")
+        hit = cache_get(key)
+        if hit is None:
+            try:
+                body, ctype = fn()
+            except Exception as exc:  # noqa: BLE001
+                self._send(500, json.dumps({"error": str(exc)}).encode(), "application/json")
+                return
+            etag = '"' + BUILD_TAG + "-" + hashlib.sha256(key.encode()).hexdigest()[:12] + '"'
+            hit = (etag, gzip.compress(body, 6), ctype)
+            cache_put(key, *hit)
+        self._send_cached(*hit, page=(u.path == "/"))
+
+    def _send_cached(self, etag: str, gz: bytes, ctype: str, page: bool = False):
+        """Serve a cached answer: 304 when the client already has this ETag, gzip when accepted.
+        The page itself is kept briefly (app updates show within minutes); data answers for a day
+        in browsers and a week in a shared cache, since they only change with a rebuild."""
+        if self._public():
+            cc = ("public, max-age=300, s-maxage=3600" if page else
+                  "public, max-age=86400, s-maxage=604800, stale-while-revalidate=86400")
+        else:
+            cc = "private, max-age=300" if page else "private, max-age=86400"
+        inm = self.headers.get("If-None-Match", "")
+        if etag in [t.strip() for t in inm.split(",")]:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", cc)
+            self.send_header("Vary", "Accept-Encoding")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        use_gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
+        body = gz if use_gz else gzip.decompress(gz)
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", cc)
+        self.send_header("Vary", "Accept-Encoding")
+        if use_gz:
+            self.send_header("Content-Encoding", "gzip")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         u = urlparse(self.path)
         user = self._auth_user()
+        self.close_connection = True    # bodies may go unread on the error paths below
         if user is None:
             self.send_response(401)
             self.send_header("WWW-Authenticate", 'Basic realm="Source Text"')
